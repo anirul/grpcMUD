@@ -1,7 +1,8 @@
-#include <iostream>
+#include "ClientApp.hpp"
 
-int main()
+int main(int argc, char** argv)
 {
-    std::cout << "grpcMUD client scaffold is ready." << std::endl;
-    return 0;
+    grpcmud::client::ClientApp app;
+    return app.Run(argc, argv);
 }
+
