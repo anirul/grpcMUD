@@ -88,6 +88,12 @@ enum Direction {
   DIRECTION_WEST = 4;
 }
 
+enum SquareKind {
+  SQUARE_KIND_UNSPECIFIED = 0;
+  SQUARE_KIND_FLOOR = 1;
+  SQUARE_KIND_WALL = 2;
+}
+
 message VisibleSquare {
   string square_id = 1;
   int32 x = 2;
@@ -96,6 +102,7 @@ message VisibleSquare {
   bool open_east = 5;
   bool open_south = 6;
   bool open_west = 7;
+  SquareKind kind = 8;
 }
 
 message VisibleActor {
@@ -114,6 +121,24 @@ message VisibleActor {
   Direction facing = 6;
 }
 
+message FirstPersonCell {
+  int32 depth = 1;
+  int32 lane = 2;
+  bool visible = 3;
+  bool open_forward = 4;
+  bool open_left = 5;
+  bool open_right = 6;
+  VisibleActor.Kind actor_kind = 7;
+  Direction actor_facing = 8;
+  string actor_name = 9;
+}
+
+message FirstPersonView {
+  Direction facing = 1;
+  int32 max_depth = 2;
+  repeated FirstPersonCell cells = 3;
+}
+
 message LocalViewUpdate {
   string center_square_id = 1;
   int32 center_x = 2;
@@ -122,6 +147,7 @@ message LocalViewUpdate {
   int32 radius = 5;
   repeated VisibleSquare squares = 6;
   repeated VisibleActor actors = 7;
+  FirstPersonView first_person = 8;
 }
 
 // Persistent square map storage for the server-side world database.
@@ -134,6 +160,7 @@ message SquareRecord {
   bool open_south = 6;
   bool open_west = 7;
   string description = 8;
+  SquareKind kind = 9;
 }
 
 message SquareMapData {

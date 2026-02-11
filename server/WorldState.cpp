@@ -8,6 +8,8 @@
 #include <fstream>
 #include <queue>
 #include <sstream>
+#include <utility>
+#include <unordered_set>
 
 #include "mud.pb.h"
 
@@ -15,8 +17,8 @@ namespace grpcmud::server
 {
 namespace
 {
-constexpr int kDefaultMapWidth = 6;
-constexpr int kDefaultMapHeight = 6;
+constexpr int kDefaultMapWidth = 11;
+constexpr int kDefaultMapHeight = 11;
 constexpr int kPlayerMaxHp = 5;
 constexpr int kNpcMaxHp = 4;
 constexpr int kMeleeRange = 1;
@@ -56,6 +58,22 @@ FacingDirection RotateRight(FacingDirection direction)
     }
     return FacingDirection::kNorth;
 }
+
+std::pair<int, int> DirectionStep(FacingDirection direction)
+{
+    switch (direction)
+    {
+    case FacingDirection::kNorth:
+        return {0, -1};
+    case FacingDirection::kEast:
+        return {1, 0};
+    case FacingDirection::kSouth:
+        return {0, 1};
+    case FacingDirection::kWest:
+        return {-1, 0};
+    }
+    return {0, 0};
+}
 }
 
 std::string FacingDirectionToString(FacingDirection direction)
@@ -77,11 +95,13 @@ std::string FacingDirectionToString(FacingDirection direction)
 WorldState::WorldState(std::string map_db_path)
     : map_db_path_(std::move(map_db_path)), rng_(std::random_device{}())
 {
-    if (!LoadMapDataFromDisk())
+    const bool loaded_from_disk = LoadMapDataFromDisk();
+    if (!loaded_from_disk || !HasWallSquares())
     {
         CreateDefaultMapData();
         SaveMapDataToDisk();
     }
+    RecomputeOpenEdgesFromWalls();
 
     BuildCoordinateIndex();
     SpawnDefaultNpcs();
@@ -95,9 +115,16 @@ PlayerSnapshot WorldState::AddPlayer(const std::string& requested_name)
     player.id = "player-" + std::to_string(next_player_id_++);
     player.name = requested_name;
     player.square_id = RandomFreeSquareId();
-    if (player.square_id.empty() && !squares_.empty())
+    if (player.square_id.empty())
     {
-        player.square_id = squares_.begin()->first;
+        for (const auto& [id, square] : squares_)
+        {
+            if (square.kind == SquareKind::kFloor)
+            {
+                player.square_id = id;
+                break;
+            }
+        }
     }
     player.facing = FacingDirection::kNorth;
     player.alive = true;
@@ -530,6 +557,10 @@ std::string WorldState::DescribeSquareForPlayer(const std::string& player_id) co
     }
 
     const Square& square = square_it->second;
+    if (square.kind == SquareKind::kWall)
+    {
+        return "You are inside a wall tile, which should never happen.";
+    }
 
     std::vector<std::string> exits;
     const auto add_exit = [&](FacingDirection direction)
@@ -623,7 +654,8 @@ std::optional<LocalView> WorldState::BuildLocalView(const std::string& player_id
 
         visible_square_ids.insert(square_id);
         view.squares.push_back(ViewSquare{
-            square.id, square.x, square.y, square.open_north, square.open_east, square.open_south,
+            square.id, square.x, square.y, square.kind, square.open_north, square.open_east,
+            square.open_south,
             square.open_west});
     }
 
@@ -701,6 +733,121 @@ std::optional<LocalView> WorldState::BuildLocalView(const std::string& player_id
                   }
                   return lhs.actor_id < rhs.actor_id;
               });
+
+    return view;
+}
+
+std::optional<FirstPersonView> WorldState::BuildFirstPersonView(const std::string& player_id,
+                                                                int max_depth) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto player_it = players_.find(player_id);
+    if (player_it == players_.end())
+    {
+        return std::nullopt;
+    }
+    if (!player_it->second.alive)
+    {
+        return std::nullopt;
+    }
+
+    auto center_it = squares_.find(player_it->second.square_id);
+    if (center_it == squares_.end())
+    {
+        return std::nullopt;
+    }
+
+    const FacingDirection facing = player_it->second.facing;
+    const FacingDirection left_facing = RotateLeft(facing);
+    const FacingDirection right_facing = RotateRight(facing);
+    const auto [forward_dx, forward_dy] = DirectionStep(facing);
+    const auto [right_dx, right_dy] = DirectionStep(right_facing);
+
+    FirstPersonView view;
+    view.facing = facing;
+    view.max_depth = std::max(0, max_depth);
+    view.cells.reserve(static_cast<std::size_t>((view.max_depth + 1) * (view.max_depth + 1)));
+
+    const auto* center_square = &center_it->second;
+    const auto find_square_by_coord = [&](int x, int y) -> const Square*
+    {
+        auto coord_it = coordinate_index_.find(CoordinateKey(x, y));
+        if (coord_it == coordinate_index_.end())
+        {
+            return nullptr;
+        }
+        auto square_it = squares_.find(coord_it->second);
+        return (square_it == squares_.end()) ? nullptr : &square_it->second;
+    };
+
+    for (int depth = 0; depth <= view.max_depth; ++depth)
+    {
+        for (int lane = -depth; lane <= depth; ++lane)
+        {
+            FirstPersonCell cell;
+            cell.depth = depth;
+            cell.lane = lane;
+
+            const int target_x = center_square->x + (forward_dx * depth) + (right_dx * lane);
+            const int target_y = center_square->y + (forward_dy * depth) + (right_dy * lane);
+            const Square* target_square = find_square_by_coord(target_x, target_y);
+            if (target_square == nullptr || !HasLineOfSight(*center_square, *target_square))
+            {
+                view.cells.push_back(std::move(cell));
+                continue;
+            }
+
+            cell.visible = true;
+            cell.open_forward = NeighborSquareId(*target_square, facing).has_value();
+            cell.open_left = NeighborSquareId(*target_square, left_facing).has_value();
+            cell.open_right = NeighborSquareId(*target_square, right_facing).has_value();
+
+            if (target_square->id == player_it->second.square_id)
+            {
+                cell.has_actor = true;
+                cell.actor_kind = ViewActorKind::kSelf;
+                cell.actor_facing = player_it->second.facing;
+                cell.actor_name = player_it->second.name;
+                view.cells.push_back(std::move(cell));
+                continue;
+            }
+
+            for (const auto& [id, player] : players_)
+            {
+                if (!player.alive || id == player_id || player.square_id != target_square->id)
+                {
+                    continue;
+                }
+
+                cell.has_actor = true;
+                cell.actor_kind = ViewActorKind::kPlayer;
+                cell.actor_facing = player.facing;
+                cell.actor_name = player.name;
+                break;
+            }
+
+            if (!cell.has_actor)
+            {
+                for (const auto& [id, npc] : npcs_)
+                {
+                    (void)id;
+                    if (npc.square_id != target_square->id)
+                    {
+                        continue;
+                    }
+
+                    cell.has_actor = true;
+                    cell.actor_kind = ViewActorKind::kNpc;
+                    cell.actor_facing = npc.facing;
+                    cell.actor_name = npc.name;
+                    break;
+                }
+            }
+
+            view.cells.push_back(std::move(cell));
+        }
+    }
 
     return view;
 }
@@ -839,6 +986,11 @@ bool WorldState::LoadMapDataFromDisk()
         square.id = record.square_id();
         square.x = record.x();
         square.y = record.y();
+        square.kind = SquareKind::kFloor;
+        if (record.kind() == mud::v1::SQUARE_KIND_WALL)
+        {
+            square.kind = SquareKind::kWall;
+        }
         square.open_north = record.open_north();
         square.open_east = record.open_east();
         square.open_south = record.open_south();
@@ -846,7 +998,9 @@ bool WorldState::LoadMapDataFromDisk()
         square.description = record.description();
         if (square.description.empty())
         {
-            square.description = "A training square on the quest board.";
+            square.description = (square.kind == SquareKind::kWall)
+                                     ? "A rough stone wall blocks the way."
+                                     : "A training square on the quest board.";
         }
 
         squares_[square.id] = square;
@@ -888,6 +1042,8 @@ bool WorldState::SaveMapDataToDisk() const
         record->set_open_south(square.open_south);
         record->set_open_west(square.open_west);
         record->set_description(square.description);
+        record->set_kind(square.kind == SquareKind::kWall ? mud::v1::SQUARE_KIND_WALL
+                                                          : mud::v1::SQUARE_KIND_FLOOR);
     }
 
     std::ofstream output(db_path, std::ios::binary | std::ios::trunc);
@@ -912,26 +1068,82 @@ void WorldState::CreateDefaultMapData()
             square.id = "sq-" + std::to_string(x) + "-" + std::to_string(y);
             square.x = x;
             square.y = y;
+            square.kind = SquareKind::kFloor;
 
-            square.open_north = y > 0;
-            square.open_south = y < (map_height_ - 1);
-            square.open_east = x < (map_width_ - 1);
-            square.open_west = x > 0;
-
-            // One long divider wall with gates at top and bottom rows.
-            if (x == 2 && y > 0 && y < (map_height_ - 1))
+            if (x == 0 || y == 0 || x == (map_width_ - 1) || y == (map_height_ - 1))
             {
-                square.open_east = false;
-            }
-            if (x == 3 && y > 0 && y < (map_height_ - 1))
-            {
-                square.open_west = false;
+                square.kind = SquareKind::kWall;
             }
 
-            square.description = "A battle square on the quest board.";
+            // Thick maze walls inside the arena.
+            if ((x == 5 && y >= 2 && y <= 8 && y != 5) ||
+                (y == 5 && x >= 2 && x <= 8 && x != 5) ||
+                (x == 3 && y == 3) || (x == 7 && y == 7) || (x == 3 && y == 7) ||
+                (x == 7 && y == 3))
+            {
+                square.kind = SquareKind::kWall;
+            }
+
+            square.description = (square.kind == SquareKind::kWall)
+                                     ? "A rough stone wall blocks the way."
+                                     : "A battle square on the quest board.";
             squares_[square.id] = square;
         }
     }
+    RecomputeOpenEdgesFromWalls();
+}
+
+void WorldState::RecomputeOpenEdgesFromWalls()
+{
+    BuildCoordinateIndex();
+
+    for (auto& [id, square] : squares_)
+    {
+        (void)id;
+
+        square.open_north = false;
+        square.open_east = false;
+        square.open_south = false;
+        square.open_west = false;
+
+        if (square.kind == SquareKind::kWall)
+        {
+            continue;
+        }
+
+        const auto can_open_to = [&](int nx, int ny) -> bool
+        {
+            auto coord_it = coordinate_index_.find(CoordinateKey(nx, ny));
+            if (coord_it == coordinate_index_.end())
+            {
+                return false;
+            }
+            auto neighbor_it = squares_.find(coord_it->second);
+            if (neighbor_it == squares_.end())
+            {
+                return false;
+            }
+            return neighbor_it->second.kind == SquareKind::kFloor;
+        };
+
+        square.open_north = can_open_to(square.x, square.y - 1);
+        square.open_east = can_open_to(square.x + 1, square.y);
+        square.open_south = can_open_to(square.x, square.y + 1);
+        square.open_west = can_open_to(square.x - 1, square.y);
+    }
+}
+
+bool WorldState::HasWallSquares() const
+{
+    for (const auto& [id, square] : squares_)
+    {
+        (void)id;
+        if (square.kind == SquareKind::kWall)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 void WorldState::BuildCoordinateIndex()
@@ -961,6 +1173,11 @@ void WorldState::SpawnDefaultNpcs()
         }
 
         const std::string& square_id = key_it->second;
+        auto square_it = squares_.find(square_id);
+        if (square_it == squares_.end() || square_it->second.kind == SquareKind::kWall)
+        {
+            return;
+        }
         if (IsSquareOccupied(square_id))
         {
             return;
@@ -976,13 +1193,18 @@ void WorldState::SpawnDefaultNpcs()
         npcs_[npc.id] = npc;
     };
 
-    add_npc("wolf scout", map_width_ - 1, map_height_ - 1);
-    add_npc("bandit archer", map_width_ - 1, 0);
+    add_npc("wolf scout", map_width_ - 2, map_height_ - 2);
+    add_npc("bandit archer", map_width_ - 2, 1);
     add_npc("rust sentinel", map_width_ / 2, map_height_ / 2);
 }
 
 bool WorldState::IsSquareOpen(const Square& square, FacingDirection direction) const
 {
+    if (square.kind == SquareKind::kWall)
+    {
+        return false;
+    }
+
     switch (direction)
     {
     case FacingDirection::kNorth:
@@ -1060,46 +1282,6 @@ std::optional<std::string> WorldState::NeighborSquareId(const Square& square,
     return neighbor_id;
 }
 
-bool WorldState::CanTraverseBetweenCells(int from_x, int from_y, int to_x, int to_y) const
-{
-    const int dx = to_x - from_x;
-    const int dy = to_y - from_y;
-    if ((std::abs(dx) + std::abs(dy)) != 1)
-    {
-        return false;
-    }
-
-    auto from_coord_it = coordinate_index_.find(CoordinateKey(from_x, from_y));
-    auto to_coord_it = coordinate_index_.find(CoordinateKey(to_x, to_y));
-    if (from_coord_it == coordinate_index_.end() || to_coord_it == coordinate_index_.end())
-    {
-        return false;
-    }
-
-    auto from_square_it = squares_.find(from_coord_it->second);
-    if (from_square_it == squares_.end())
-    {
-        return false;
-    }
-
-    FacingDirection direction = FacingDirection::kNorth;
-    if (dx == 1)
-    {
-        direction = FacingDirection::kEast;
-    }
-    else if (dx == -1)
-    {
-        direction = FacingDirection::kWest;
-    }
-    else if (dy == 1)
-    {
-        direction = FacingDirection::kSouth;
-    }
-
-    const auto neighbor_id = NeighborSquareId(from_square_it->second, direction);
-    return neighbor_id && *neighbor_id == to_coord_it->second;
-}
-
 bool WorldState::HasLineOfSight(const Square& from, const Square& to) const
 {
     if (from.id == to.id)
@@ -1123,6 +1305,7 @@ bool WorldState::HasLineOfSight(const Square& from, const Square& to) const
 
     int current_x = from.x;
     int current_y = from.y;
+    bool reached_target = false;
 
     for (int i = 1; i <= sample_count; ++i)
     {
@@ -1135,51 +1318,42 @@ bool WorldState::HasLineOfSight(const Square& from, const Square& to) const
             continue;
         }
 
-        const int step_x = sample_x - current_x;
-        const int step_y = sample_y - current_y;
-        if (std::abs(step_x) > 1 || std::abs(step_y) > 1)
+        auto coord_it = coordinate_index_.find(CoordinateKey(sample_x, sample_y));
+        if (coord_it == coordinate_index_.end())
         {
             return false;
         }
 
-        bool traversable = false;
-        if (step_x != 0 && step_y != 0)
-        {
-            // Crossing exactly near a corner: accept only if one L-shaped path is open.
-            const bool horizontal_then_vertical =
-                CanTraverseBetweenCells(current_x, current_y, current_x + step_x, current_y) &&
-                CanTraverseBetweenCells(current_x + step_x, current_y, sample_x, sample_y);
-            const bool vertical_then_horizontal =
-                CanTraverseBetweenCells(current_x, current_y, current_x, current_y + step_y) &&
-                CanTraverseBetweenCells(current_x, current_y + step_y, sample_x, sample_y);
-            traversable = horizontal_then_vertical || vertical_then_horizontal;
-        }
-        else
-        {
-            traversable = CanTraverseBetweenCells(current_x, current_y, sample_x, sample_y);
-        }
-
-        if (!traversable)
+        auto square_it = squares_.find(coord_it->second);
+        if (square_it == squares_.end())
         {
             return false;
+        }
+
+        const bool is_target = (sample_x == to.x && sample_y == to.y);
+        if (square_it->second.kind == SquareKind::kWall)
+        {
+            return is_target;
         }
 
         current_x = sample_x;
         current_y = sample_y;
-        if (current_x == to.x && current_y == to.y)
+        if (is_target)
         {
-            return true;
+            reached_target = true;
+            break;
         }
     }
 
-    return current_x == to.x && current_y == to.y;
+    return reached_target;
 }
 
 std::unordered_map<std::string, int> WorldState::DistancesFrom(const std::string& origin_square_id,
                                                                int max_distance) const
 {
     std::unordered_map<std::string, int> distances;
-    if (squares_.find(origin_square_id) == squares_.end())
+    auto origin_it = squares_.find(origin_square_id);
+    if (origin_it == squares_.end() || origin_it->second.kind == SquareKind::kWall)
     {
         return distances;
     }
@@ -1269,8 +1443,11 @@ std::string WorldState::RandomFreeSquareId(const std::unordered_set<std::string>
 
     for (const auto& [id, square] : squares_)
     {
-        (void)square;
         if (exclusions.find(id) != exclusions.end())
+        {
+            continue;
+        }
+        if (square.kind == SquareKind::kWall)
         {
             continue;
         }

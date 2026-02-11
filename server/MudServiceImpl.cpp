@@ -81,6 +81,18 @@ mud::v1::VisibleActor::Kind ToProtoActorKind(ViewActorKind kind)
     }
     return mud::v1::VisibleActor::KIND_UNSPECIFIED;
 }
+
+mud::v1::SquareKind ToProtoSquareKind(SquareKind kind)
+{
+    switch (kind)
+    {
+    case SquareKind::kFloor:
+        return mud::v1::SQUARE_KIND_FLOOR;
+    case SquareKind::kWall:
+        return mud::v1::SQUARE_KIND_WALL;
+    }
+    return mud::v1::SQUARE_KIND_UNSPECIFIED;
+}
 } // namespace
 
 MudServiceImpl::MudServiceImpl(const std::string& map_db_path) : world_(map_db_path)
@@ -721,6 +733,7 @@ bool MudServiceImpl::SendViewUpdate(const std::shared_ptr<ClientSession>& sessio
     {
         return false;
     }
+    const auto first_person = world_.BuildFirstPersonView(player_id, first_person_depth_squares_);
 
     mud::v1::ServerMessage out = MakeBaseMessage(tick_id);
     auto* view_out = out.mutable_view();
@@ -740,6 +753,7 @@ bool MudServiceImpl::SendViewUpdate(const std::shared_ptr<ClientSession>& sessio
         square_out->set_open_east(square.open_east);
         square_out->set_open_south(square.open_south);
         square_out->set_open_west(square.open_west);
+        square_out->set_kind(ToProtoSquareKind(square.kind));
     }
 
     for (const auto& actor : view->actors)
@@ -751,6 +765,30 @@ bool MudServiceImpl::SendViewUpdate(const std::shared_ptr<ClientSession>& sessio
         actor_out->set_y(actor.y);
         actor_out->set_kind(ToProtoActorKind(actor.kind));
         actor_out->set_facing(ToProtoDirection(actor.facing));
+    }
+
+    if (first_person)
+    {
+        auto* fp_out = view_out->mutable_first_person();
+        fp_out->set_facing(ToProtoDirection(first_person->facing));
+        fp_out->set_max_depth(first_person->max_depth);
+
+        for (const auto& cell : first_person->cells)
+        {
+            auto* cell_out = fp_out->add_cells();
+            cell_out->set_depth(cell.depth);
+            cell_out->set_lane(cell.lane);
+            cell_out->set_visible(cell.visible);
+            cell_out->set_open_forward(cell.open_forward);
+            cell_out->set_open_left(cell.open_left);
+            cell_out->set_open_right(cell.open_right);
+            if (cell.has_actor)
+            {
+                cell_out->set_actor_kind(ToProtoActorKind(cell.actor_kind));
+                cell_out->set_actor_facing(ToProtoDirection(cell.actor_facing));
+                cell_out->set_actor_name(cell.actor_name);
+            }
+        }
     }
 
     return session->Write(std::move(out));

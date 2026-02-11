@@ -67,6 +67,7 @@ private:
     std::mutex sessions_mutex_;
     std::unordered_map<std::string, std::weak_ptr<ClientSession>> sessions_;
     const int say_range_squares_ = 3;
-    const int view_radius_squares_ = 4;
+    const int view_radius_squares_ = 2;
+    const int first_person_depth_squares_ = 2;
 };
 } // namespace grpcmud::server

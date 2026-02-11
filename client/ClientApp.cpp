@@ -43,7 +43,8 @@ int ClientApp::Run(int argc, char** argv)
     ui_.SetMode(UiMode::kMove);
     ui_.AddLog("Connected to " + server_address_ + " as '" + player_name_ + "'.");
     ui_.AddLog("Move mode: W/S=forward/backward, A/D=turn, 1=melee, 2=ranged, 3=guard.");
-    ui_.AddLog("Press Enter to chat. Prefix with '/' to send a command.");
+    ui_.AddLog("Map view enabled by default. V or '/view fps' toggles experimental FPS view.");
+    ui_.AddLog("Press Enter to chat. Prefix with '/' for commands.");
     ui_.Render();
 
     while (running_.load(std::memory_order_relaxed))
@@ -335,6 +336,14 @@ void ClientApp::HandleMoveInput(int ch)
         ui_.Render();
         return;
     }
+    if (key == 'v')
+    {
+        ui_.ToggleRenderMode();
+        ui_.AddLog(std::string("[ui] View mode: ") +
+                   (ui_.IsRenderMapDebug() ? "map (debug)" : "fps"));
+        ui_.Render();
+        return;
+    }
     if (key == '/')
     {
         ui_.SetMode(UiMode::kCustomCommand);
@@ -377,7 +386,28 @@ void ClientApp::HandleTextInput(int ch)
         {
             if (text[0] == '/')
             {
-                SendCommandText(Trim(text.substr(1)));
+                const std::string command = Trim(text.substr(1));
+                const std::string lowered = ToLower(command);
+                if (lowered == "view")
+                {
+                    ui_.ToggleRenderMode();
+                    ui_.AddLog(std::string("[ui] View mode: ") +
+                               (ui_.IsRenderMapDebug() ? "map (debug)" : "fps"));
+                }
+                else if (lowered == "view map")
+                {
+                    ui_.SetRenderMapDebug(true);
+                    ui_.AddLog("[ui] View mode: map (debug)");
+                }
+                else if (lowered == "view fps")
+                {
+                    ui_.SetRenderMapDebug(false);
+                    ui_.AddLog("[ui] View mode: fps");
+                }
+                else
+                {
+                    SendCommandText(command);
+                }
             }
             else
             {

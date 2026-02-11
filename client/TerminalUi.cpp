@@ -3,6 +3,7 @@
 #include <iostream>
 #include <utility>
 
+#include "FpsRenderer.hpp"
 #include "MapRenderer.hpp"
 
 namespace grpcmud::client
@@ -98,6 +99,24 @@ bool TerminalUi::IsDeathScreenActive() const
     return death_screen_active_;
 }
 
+void TerminalUi::ToggleRenderMode()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    render_map_debug_ = !render_map_debug_;
+}
+
+void TerminalUi::SetRenderMapDebug(bool enabled)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    render_map_debug_ = enabled;
+}
+
+bool TerminalUi::IsRenderMapDebug() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return render_map_debug_;
+}
+
 void TerminalUi::Render() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -118,8 +137,17 @@ void TerminalUi::Render() const
         std::cout << "Center: " << view_->center_square_id() << " (" << view_->center_x() << ","
                   << view_->center_y() << ") "
                   << "Facing: " << FacingLabel(view_->facing()) << '\n';
-        std::cout << "Legend: @^=you P>=player N<=npc .=square ???=fog walls=|---" << '\n';
-        std::cout << MapRenderer::Render(*view_);
+        std::cout << "View: " << (render_map_debug_ ? "Map (debug)" : "FPS") << '\n';
+        if (!render_map_debug_ && view_->has_first_person())
+        {
+            std::cout << FpsRenderer::Render(view_->first_person());
+        }
+        else
+        {
+            std::cout << "Legend: @^=you P>=player N<=npc .=floor ###=wall ???=fog walls=|---"
+                      << '\n';
+            std::cout << MapRenderer::Render(*view_);
+        }
     }
     else
     {
@@ -143,7 +171,7 @@ void TerminalUi::Render() const
         }
         else
         {
-            std::cout << "[Move] W/S:move A/D:turn 1:melee 2:ranged 3:guard Enter:chat(/cmd) P:ping Q:quit"
+            std::cout << "[Move] W/S:move A/D:turn 1:melee 2:ranged 3:guard V:view Enter:chat(/cmd) P:ping Q:quit"
                       << '\n';
         }
         break;
@@ -154,7 +182,7 @@ void TerminalUi::Render() const
         }
         else
         {
-            std::cout << "[Input] Enter to send. Chat by default, '/<cmd>' for commands: "
+            std::cout << "[Input] Enter to send. Chat by default, '/<cmd>' for commands ('/view map|fps'): "
                       << input_buffer_ << '\n';
         }
         break;
@@ -167,7 +195,7 @@ void TerminalUi::Render() const
         }
         else
         {
-            std::cout << "[Move] W/S:move A/D:turn 1:melee 2:ranged 3:guard Enter:chat(/cmd) P:ping Q:quit"
+            std::cout << "[Move] W/S:move A/D:turn 1:melee 2:ranged 3:guard V:view Enter:chat(/cmd) P:ping Q:quit"
                       << '\n';
         }
         break;

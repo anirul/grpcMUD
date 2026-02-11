@@ -26,6 +26,12 @@ enum class WeaponType
     kRanged
 };
 
+enum class SquareKind
+{
+    kFloor,
+    kWall
+};
+
 std::string FacingDirectionToString(FacingDirection direction);
 
 struct ViewSquare
@@ -33,6 +39,7 @@ struct ViewSquare
     std::string square_id;
     int x = 0;
     int y = 0;
+    SquareKind kind = SquareKind::kFloor;
     bool open_north = false;
     bool open_east = false;
     bool open_south = false;
@@ -65,6 +72,27 @@ struct LocalView
     int radius = 0;
     std::vector<ViewSquare> squares;
     std::vector<ViewActor> actors;
+};
+
+struct FirstPersonCell
+{
+    int depth = 0;
+    int lane = 0;
+    bool visible = false;
+    bool open_forward = false;
+    bool open_left = false;
+    bool open_right = false;
+    bool has_actor = false;
+    ViewActorKind actor_kind = ViewActorKind::kPlayer;
+    FacingDirection actor_facing = FacingDirection::kNorth;
+    std::string actor_name;
+};
+
+struct FirstPersonView
+{
+    FacingDirection facing = FacingDirection::kNorth;
+    int max_depth = 0;
+    std::vector<FirstPersonCell> cells;
 };
 
 struct PlayerSnapshot
@@ -145,6 +173,8 @@ public:
 
     std::string DescribeSquareForPlayer(const std::string& player_id) const;
     std::optional<LocalView> BuildLocalView(const std::string& player_id, int radius) const;
+    std::optional<FirstPersonView> BuildFirstPersonView(const std::string& player_id,
+                                                        int max_depth) const;
     std::vector<NearbyPlayer> GetPlayersWithinRange(const std::string& origin_square_id,
                                                     int max_distance) const;
 
@@ -154,6 +184,7 @@ private:
         std::string id;
         int x = 0;
         int y = 0;
+        SquareKind kind = SquareKind::kFloor;
         bool open_north = false;
         bool open_east = false;
         bool open_south = false;
@@ -192,6 +223,8 @@ private:
     bool LoadMapDataFromDisk();
     bool SaveMapDataToDisk() const;
     void CreateDefaultMapData();
+    void RecomputeOpenEdgesFromWalls();
+    bool HasWallSquares() const;
     void BuildCoordinateIndex();
     void SpawnDefaultNpcs();
 
@@ -199,7 +232,6 @@ private:
     FacingDirection OppositeDirection(FacingDirection direction) const;
     std::optional<std::string> NeighborSquareId(const Square& square,
                                                 FacingDirection direction) const;
-    bool CanTraverseBetweenCells(int from_x, int from_y, int to_x, int to_y) const;
     bool HasLineOfSight(const Square& from, const Square& to) const;
     std::unordered_map<std::string, int> DistancesFrom(const std::string& origin_square_id,
                                                        int max_distance) const;

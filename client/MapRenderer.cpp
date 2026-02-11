@@ -127,6 +127,11 @@ std::string MapRenderer::Render(const mud::v1::LocalViewUpdate& view)
         return (it == squares_by_coord.end()) ? nullptr : it->second;
     };
 
+    const auto is_wall_square = [&](const mud::v1::VisibleSquare* square) -> bool
+    {
+        return square != nullptr && square->kind() == mud::v1::SQUARE_KIND_WALL;
+    };
+
     const auto horizontal_boundary = [&](int x, int boundary_y) -> BoundaryState
     {
         const auto* above = find_square(x, boundary_y - 1);
@@ -220,14 +225,21 @@ std::string MapRenderer::Render(const mud::v1::LocalViewUpdate& view)
             const auto* square = find_square(x, y);
             if (square != nullptr)
             {
-                const auto actor_it = actor_by_coord.find(CoordKey(x, y));
-                if (actor_it != actor_by_coord.end())
+                if (is_wall_square(square))
                 {
-                    out << actor_it->second.glyph << actor_it->second.facing << ' ';
+                    out << "###";
                 }
                 else
                 {
-                    out << " . ";
+                    const auto actor_it = actor_by_coord.find(CoordKey(x, y));
+                    if (actor_it != actor_by_coord.end())
+                    {
+                        out << actor_it->second.glyph << actor_it->second.facing << ' ';
+                    }
+                    else
+                    {
+                        out << " . ";
+                    }
                 }
             }
             else

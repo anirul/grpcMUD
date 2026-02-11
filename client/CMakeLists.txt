@@ -3,6 +3,7 @@ add_executable(
   main.cpp
   ClientApp.cpp
   GrpcSession.cpp
+  FpsRenderer.cpp
   MapRenderer.cpp
   TerminalUi.cpp
 )

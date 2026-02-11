@@ -37,6 +37,9 @@ public:
     void SetDeathScreen(bool active, int seconds_remaining);
     void TickDeathScreen();
     bool IsDeathScreenActive() const;
+    void ToggleRenderMode();
+    void SetRenderMapDebug(bool enabled);
+    bool IsRenderMapDebug() const;
 
     void Render() const;
 
@@ -52,5 +55,6 @@ private:
     std::size_t max_log_lines_;
     bool death_screen_active_ = false;
     int death_seconds_remaining_ = 0;
+    bool render_map_debug_ = true;
 };
 } // namespace grpcmud::client
