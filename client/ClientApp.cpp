@@ -9,24 +9,45 @@
 #include <thread>
 #include <utility>
 
+#include "absl/flags/flag.h"
+#include "absl/flags/parse.h"
+
+ABSL_FLAG(std::string, server_address, "localhost:50051", "gRPC server address.");
+ABSL_FLAG(std::string, player_name, "",
+          "Player name to join as. If empty, the client prompts interactively.");
+
 namespace grpcmud::client
 {
 int ClientApp::Run(int argc, char** argv)
 {
-    server_address_ = (argc > 1) ? argv[1] : "localhost:50051";
-    if (argc > 2)
+    const auto positional_args = absl::ParseCommandLine(argc, argv);
+
+    if (positional_args.size() > 3)
     {
-        player_name_ = Trim(argv[2]);
+        std::cerr << "Unexpected positional arguments. Use --help for usage." << std::endl;
+        return 1;
     }
-    else
+
+    server_address_ = Trim(absl::GetFlag(FLAGS_server_address));
+    if (server_address_.empty())
     {
-        player_name_ = ReadPlayerNameFromPrompt();
+        std::cerr << "Server address cannot be empty." << std::endl;
+        return 1;
+    }
+    if (positional_args.size() > 1)
+    {
+        server_address_ = Trim(positional_args[1]);
+    }
+
+    player_name_ = Trim(absl::GetFlag(FLAGS_player_name));
+    if (positional_args.size() > 2)
+    {
+        player_name_ = Trim(positional_args[2]);
     }
 
     if (player_name_.empty())
     {
-        std::cerr << "Player name cannot be empty." << std::endl;
-        return 1;
+        player_name_ = ReadPlayerNameFromPrompt();
     }
 
     std::string error_message;
@@ -43,12 +64,22 @@ int ClientApp::Run(int argc, char** argv)
     ui_.SetMode(UiMode::kMove);
     ui_.AddLog("Connected to " + server_address_ + " as '" + player_name_ + "'.");
     ui_.AddLog("Move mode: W/S=forward/backward, A/D=turn, 1=melee, 2=ranged, 3=guard.");
-    ui_.AddLog("Map view enabled by default. V or '/view fps' toggles experimental FPS view.");
+    ui_.AddLog("FPS view enabled by default. V or '/view map' toggles debug map view.");
     ui_.AddLog("Press Enter to chat. Prefix with '/' for commands.");
     ui_.Render();
 
+    constexpr auto kRenderInterval = std::chrono::milliseconds(250);
+    auto next_render_at = std::chrono::steady_clock::now() + kRenderInterval;
+
     while (running_.load(std::memory_order_relaxed))
     {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_render_at)
+        {
+            ui_.Render();
+            next_render_at = now + kRenderInterval;
+        }
+
         if (!_kbhit())
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(25));
@@ -123,7 +154,39 @@ bool ClientApp::IsPrintableChar(int ch)
     return ch >= 32 && ch <= 126;
 }
 
-bool ClientApp::SendCommandText(const std::string& text)
+std::string ClientApp::NextRequestId()
+{
+    return "req-" + std::to_string(request_counter_++);
+}
+
+bool ClientApp::SendMessage(mud::v1::ClientMessage message)
+{
+    if (!session_.SendClientMessage(message))
+    {
+        ui_.AddLog("[error] Failed to send command.");
+        running_.store(false, std::memory_order_relaxed);
+        return false;
+    }
+    return true;
+}
+
+bool ClientApp::SendLookRequest()
+{
+    mud::v1::ClientMessage message;
+    message.mutable_look()->set_request_id(NextRequestId());
+    return SendMessage(std::move(message));
+}
+
+bool ClientApp::SendStepRequest(mud::v1::StepKind kind)
+{
+    mud::v1::ClientMessage message;
+    auto* step = message.mutable_step();
+    step->set_request_id(NextRequestId());
+    step->set_kind(kind);
+    return TrySendMoveOrTurnCommand(std::move(message));
+}
+
+bool ClientApp::SendSayRequest(const std::string& text)
 {
     const std::string trimmed = Trim(text);
     if (trimmed.empty())
@@ -131,15 +194,27 @@ bool ClientApp::SendCommandText(const std::string& text)
         return false;
     }
 
-    const std::string request_id = "req-" + std::to_string(request_counter_++);
-    if (!session_.SendCommand(request_id, trimmed))
-    {
-        ui_.AddLog("[error] Failed to send command.");
-        running_.store(false, std::memory_order_relaxed);
-        return false;
-    }
+    mud::v1::ClientMessage message;
+    auto* say = message.mutable_say();
+    say->set_request_id(NextRequestId());
+    say->set_text(trimmed);
+    return SendMessage(std::move(message));
+}
 
-    return true;
+bool ClientApp::SendGuardRequest()
+{
+    mud::v1::ClientMessage message;
+    message.mutable_guard()->set_request_id(NextRequestId());
+    return SendMessage(std::move(message));
+}
+
+bool ClientApp::SendAttackRequest(mud::v1::WeaponKind weapon)
+{
+    mud::v1::ClientMessage message;
+    auto* attack = message.mutable_attack();
+    attack->set_request_id(NextRequestId());
+    attack->set_weapon(weapon);
+    return SendMessage(std::move(message));
 }
 
 void ClientApp::HandleServerMessage(const mud::v1::ServerMessage& message)
@@ -310,19 +385,19 @@ void ClientApp::HandleMoveInput(int ch)
     }
     if (key == '1')
     {
-        SendCommandText("attack melee");
+        SendAttackRequest(mud::v1::WEAPON_KIND_MELEE);
         ui_.Render();
         return;
     }
     if (key == '2')
     {
-        SendCommandText("attack ranged");
+        SendAttackRequest(mud::v1::WEAPON_KIND_RANGED);
         ui_.Render();
         return;
     }
     if (key == '3')
     {
-        SendCommandText("guard");
+        SendGuardRequest();
         ui_.Render();
         return;
     }
@@ -353,25 +428,25 @@ void ClientApp::HandleMoveInput(int ch)
     }
     if (key == 'w' || key == 'k')
     {
-        TrySendMoveOrTurnCommand("move forward");
+        SendStepRequest(mud::v1::STEP_KIND_MOVE_FORWARD);
         ui_.Render();
         return;
     }
     if (key == 'a' || key == 'h')
     {
-        TrySendMoveOrTurnCommand("turn left");
+        SendStepRequest(mud::v1::STEP_KIND_TURN_LEFT);
         ui_.Render();
         return;
     }
     if (key == 's' || key == 'j')
     {
-        TrySendMoveOrTurnCommand("move backward");
+        SendStepRequest(mud::v1::STEP_KIND_MOVE_BACKWARD);
         ui_.Render();
         return;
     }
     if (key == 'd' || key == 'l')
     {
-        TrySendMoveOrTurnCommand("turn right");
+        SendStepRequest(mud::v1::STEP_KIND_TURN_RIGHT);
         ui_.Render();
         return;
     }
@@ -406,12 +481,97 @@ void ClientApp::HandleTextInput(int ch)
                 }
                 else
                 {
-                    SendCommandText(command);
+                    const auto split = command.find(' ');
+                    const std::string verb =
+                        ToLower(split == std::string::npos ? command : command.substr(0, split));
+                    const std::string argument =
+                        Trim(split == std::string::npos ? std::string{} : command.substr(split + 1));
+                    const std::string normalized_argument = ToLower(argument);
+
+                    if (verb == "look")
+                    {
+                        SendLookRequest();
+                    }
+                    else if (verb == "move")
+                    {
+                        if (normalized_argument == "forward" || normalized_argument == "f")
+                        {
+                            SendStepRequest(mud::v1::STEP_KIND_MOVE_FORWARD);
+                        }
+                        else if (normalized_argument == "backward" || normalized_argument == "back" ||
+                                 normalized_argument == "b")
+                        {
+                            SendStepRequest(mud::v1::STEP_KIND_MOVE_BACKWARD);
+                        }
+                        else
+                        {
+                            ui_.AddLog("[usage] /move <forward|backward>");
+                        }
+                    }
+                    else if (verb == "turn")
+                    {
+                        if (normalized_argument == "left" || normalized_argument == "l")
+                        {
+                            SendStepRequest(mud::v1::STEP_KIND_TURN_LEFT);
+                        }
+                        else if (normalized_argument == "right" || normalized_argument == "r")
+                        {
+                            SendStepRequest(mud::v1::STEP_KIND_TURN_RIGHT);
+                        }
+                        else
+                        {
+                            ui_.AddLog("[usage] /turn <left|right>");
+                        }
+                    }
+                    else if (verb == "say")
+                    {
+                        if (argument.empty())
+                        {
+                            ui_.AddLog("[usage] /say <text>");
+                        }
+                        else
+                        {
+                            SendSayRequest(argument);
+                        }
+                    }
+                    else if (verb == "guard")
+                    {
+                        SendGuardRequest();
+                    }
+                    else if (verb == "attack")
+                    {
+                        if (normalized_argument.empty() || normalized_argument == "melee" ||
+                            normalized_argument == "m")
+                        {
+                            SendAttackRequest(mud::v1::WEAPON_KIND_MELEE);
+                        }
+                        else if (normalized_argument == "ranged" || normalized_argument == "range" ||
+                                 normalized_argument == "r")
+                        {
+                            SendAttackRequest(mud::v1::WEAPON_KIND_RANGED);
+                        }
+                        else
+                        {
+                            ui_.AddLog("[usage] /attack <melee|ranged>");
+                        }
+                    }
+                    else if (verb == "ping")
+                    {
+                        if (!session_.SendPing())
+                        {
+                            ui_.AddLog("[error] Failed to send ping.");
+                            running_.store(false, std::memory_order_relaxed);
+                        }
+                    }
+                    else
+                    {
+                        ui_.AddLog("[usage] Unknown command. Try /look, /move, /turn, /say, /guard, /attack, /ping.");
+                    }
                 }
             }
             else
             {
-                SendCommandText("say " + text);
+                SendSayRequest(text);
             }
         }
         ui_.ClearInput();
@@ -433,7 +593,7 @@ void ClientApp::HandleTextInput(int ch)
     }
 }
 
-bool ClientApp::TrySendMoveOrTurnCommand(const std::string& command_text)
+bool ClientApp::TrySendMoveOrTurnCommand(mud::v1::ClientMessage message)
 {
     const std::uint64_t current_tick = latest_tick_id_.load(std::memory_order_relaxed);
     if (move_command_sent_this_tick_ && current_tick == last_move_command_tick_id_)
@@ -442,7 +602,7 @@ bool ClientApp::TrySendMoveOrTurnCommand(const std::string& command_text)
         return false;
     }
 
-    if (!SendCommandText(command_text))
+    if (!SendMessage(std::move(message)))
     {
         return false;
     }

@@ -9,4 +9,5 @@ add_executable(
 )
 
 target_link_libraries(grpcmud_client PRIVATE grpcmud_proto)
+target_link_libraries(grpcmud_client PRIVATE absl::flags_parse)
 target_include_directories(grpcmud_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

@@ -5,7 +5,7 @@
 #include <optional>
 #include <string>
 
-#include "mud.pb.h"
+#include "gameplay.pb.h"
 
 namespace grpcmud::client
 {
@@ -44,8 +44,15 @@ public:
     void Render() const;
 
 private:
+    struct TerminalSize
+    {
+        int columns = 80;
+        int rows = 25;
+    };
+
     static const char* ModeName(UiMode mode);
     static std::string FacingLabel(mud::v1::Direction direction);
+    static TerminalSize DetectTerminalSize();
 
     mutable std::mutex mutex_;
     std::optional<mud::v1::LocalViewUpdate> view_;
@@ -55,6 +62,6 @@ private:
     std::size_t max_log_lines_;
     bool death_screen_active_ = false;
     int death_seconds_remaining_ = 0;
-    bool render_map_debug_ = true;
+    bool render_map_debug_ = false;
 };
 } // namespace grpcmud::client

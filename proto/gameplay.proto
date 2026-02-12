@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package mud.v1;
 
+import "world_storage.proto";
+
 service MudService {
   // A single game session stream. Commands are sent immediately while
   // world/tick updates are delivered asynchronously by the server.
@@ -11,8 +13,12 @@ service MudService {
 message ClientMessage {
   oneof payload {
     JoinRequest join = 1;
-    CommandRequest command = 2;
-    Ping ping = 3;
+    Ping ping = 2;
+    LookRequest look = 3;
+    StepRequest step = 4;
+    SayRequest say = 5;
+    GuardRequest guard = 6;
+    AttackRequest attack = 7;
   }
 }
 
@@ -20,12 +26,33 @@ message JoinRequest {
   string player_name = 1;
 }
 
-message CommandRequest {
+message Ping {}
+
+message LookRequest {
+  string request_id = 1;
+}
+
+enum StepKind {
+  STEP_KIND_UNSPECIFIED = 0;
+  STEP_KIND_MOVE_FORWARD = 1;
+  STEP_KIND_MOVE_BACKWARD = 2;
+  STEP_KIND_TURN_LEFT = 3;
+  STEP_KIND_TURN_RIGHT = 4;
+}
+
+message StepRequest {
+  string request_id = 1;
+  StepKind kind = 2;
+}
+
+message SayRequest {
   string request_id = 1;
   string text = 2;
 }
 
-message Ping {}
+message GuardRequest {
+  string request_id = 1;
+}
 
 message ServerMessage {
   uint64 server_time_ms = 1;
@@ -80,18 +107,15 @@ message ErrorMessage {
 
 message Pong {}
 
-enum Direction {
-  DIRECTION_UNSPECIFIED = 0;
-  DIRECTION_NORTH = 1;
-  DIRECTION_EAST = 2;
-  DIRECTION_SOUTH = 3;
-  DIRECTION_WEST = 4;
+enum WeaponKind {
+  WEAPON_KIND_UNSPECIFIED = 0;
+  WEAPON_KIND_MELEE = 1;
+  WEAPON_KIND_RANGED = 2;
 }
 
-enum SquareKind {
-  SQUARE_KIND_UNSPECIFIED = 0;
-  SQUARE_KIND_FLOOR = 1;
-  SQUARE_KIND_WALL = 2;
+message AttackRequest {
+  string request_id = 1;
+  WeaponKind weapon = 2;
 }
 
 message VisibleSquare {
@@ -148,21 +172,4 @@ message LocalViewUpdate {
   repeated VisibleSquare squares = 6;
   repeated VisibleActor actors = 7;
   FirstPersonView first_person = 8;
-}
-
-// Persistent square map storage for the server-side world database.
-message SquareRecord {
-  string square_id = 1;
-  int32 x = 2;
-  int32 y = 3;
-  bool open_north = 4;
-  bool open_east = 5;
-  bool open_south = 6;
-  bool open_west = 7;
-  string description = 8;
-  SquareKind kind = 9;
-}
-
-message SquareMapData {
-  repeated SquareRecord squares = 1;
 }

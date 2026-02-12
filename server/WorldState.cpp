@@ -6,12 +6,15 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <queue>
 #include <sstream>
 #include <utility>
 #include <unordered_set>
 
-#include "mud.pb.h"
+#include <google/protobuf/util/json_util.h>
+
+#include "gameplay.pb.h"
 
 namespace grpcmud::server
 {
@@ -74,6 +77,80 @@ std::pair<int, int> DirectionStep(FacingDirection direction)
     }
     return {0, 0};
 }
+
+mud::v1::Direction ToProtoDirection(FacingDirection direction)
+{
+    switch (direction)
+    {
+    case FacingDirection::kNorth:
+        return mud::v1::DIRECTION_NORTH;
+    case FacingDirection::kEast:
+        return mud::v1::DIRECTION_EAST;
+    case FacingDirection::kSouth:
+        return mud::v1::DIRECTION_SOUTH;
+    case FacingDirection::kWest:
+        return mud::v1::DIRECTION_WEST;
+    }
+    return mud::v1::DIRECTION_UNSPECIFIED;
+}
+
+FacingDirection ToFacingDirection(mud::v1::Direction direction)
+{
+    switch (direction)
+    {
+    case mud::v1::DIRECTION_NORTH:
+        return FacingDirection::kNorth;
+    case mud::v1::DIRECTION_EAST:
+        return FacingDirection::kEast;
+    case mud::v1::DIRECTION_SOUTH:
+        return FacingDirection::kSouth;
+    case mud::v1::DIRECTION_WEST:
+        return FacingDirection::kWest;
+    case mud::v1::DIRECTION_UNSPECIFIED:
+    default:
+        return FacingDirection::kNorth;
+    }
+}
+
+std::uint64_t ParseIdSuffix(const std::string& id, const std::string& prefix)
+{
+    if (id.size() <= prefix.size() || id.rfind(prefix, 0) != 0)
+    {
+        return 0;
+    }
+
+    const std::string suffix = id.substr(prefix.size());
+    if (suffix.empty())
+    {
+        return 0;
+    }
+
+    try
+    {
+        std::size_t parsed = 0;
+        const unsigned long long value = std::stoull(suffix, &parsed);
+        if (parsed != suffix.size())
+        {
+            return 0;
+        }
+        return static_cast<std::uint64_t>(value);
+    }
+    catch (...)
+    {
+        return 0;
+    }
+}
+
+bool IsJsonWorldFilePath(const std::filesystem::path& file_path)
+{
+    std::string extension = file_path.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](unsigned char ch)
+                   {
+                       return static_cast<char>(std::tolower(ch));
+                   });
+    return extension == ".json";
+}
 }
 
 std::string FacingDirectionToString(FacingDirection direction)
@@ -99,12 +176,23 @@ WorldState::WorldState(std::string map_db_path)
     if (!loaded_from_disk || !HasWallSquares())
     {
         CreateDefaultMapData();
-        SaveMapDataToDisk();
+        SaveMapToDisk();
     }
     RecomputeOpenEdgesFromWalls();
 
     BuildCoordinateIndex();
     SpawnDefaultNpcs();
+}
+
+bool WorldState::SaveMapToDisk() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const bool saved = SaveMapDataToDiskUnlocked();
+    if (saved)
+    {
+        std::cout << "world saved to " << map_db_path_ << std::endl;
+    }
+    return saved;
 }
 
 PlayerSnapshot WorldState::AddPlayer(const std::string& requested_name)
@@ -614,7 +702,8 @@ std::string WorldState::DescribeSquareForPlayer(const std::string& player_id) co
     return out.str();
 }
 
-std::optional<LocalView> WorldState::BuildLocalView(const std::string& player_id, int radius) const
+std::optional<LocalView> WorldState::BuildLocalView(const std::string& player_id, int front_depth,
+                                                    int back_depth, int side_depth) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -635,19 +724,29 @@ std::optional<LocalView> WorldState::BuildLocalView(const std::string& player_id
     view.center_x = center_it->second.x;
     view.center_y = center_it->second.y;
     view.facing = player_it->second.facing;
-    view.radius = std::max(0, radius);
+    const int clamped_front = std::max(0, front_depth);
+    const int clamped_back = std::max(0, back_depth);
+    const int clamped_side = std::max(0, side_depth);
+    view.radius = std::max({clamped_front, clamped_back, clamped_side});
     std::unordered_set<std::string> visible_square_ids;
     visible_square_ids.reserve(squares_.size());
+    const auto [forward_dx, forward_dy] = DirectionStep(player_it->second.facing);
+    const auto [right_dx, right_dy] = DirectionStep(RotateRight(player_it->second.facing));
 
     for (const auto& [square_id, square] : squares_)
     {
-        const int dx = std::abs(square.x - view.center_x);
-        const int dy = std::abs(square.y - view.center_y);
-        if (dx > view.radius || dy > view.radius)
+        const int rel_x = square.x - view.center_x;
+        const int rel_y = square.y - view.center_y;
+        const int forward_offset = (rel_x * forward_dx) + (rel_y * forward_dy);
+        const int side_offset = (rel_x * right_dx) + (rel_y * right_dy);
+        if (forward_offset > clamped_front || forward_offset < -clamped_back ||
+            std::abs(side_offset) > clamped_side)
         {
             continue;
         }
-        if (!HasLineOfSight(center_it->second, square))
+        const int chebyshev_distance = std::max(std::abs(rel_x), std::abs(rel_y));
+        const bool is_immediate_neighbor = chebyshev_distance <= 1;
+        if (!is_immediate_neighbor && !HasLineOfSight(center_it->second, square))
         {
             continue;
         }
@@ -954,28 +1053,55 @@ bool WorldState::LoadMapDataFromDisk()
         return false;
     }
 
-    std::ifstream input(db_path, std::ios::binary);
-    if (!input.is_open())
+    mud::v1::WorldData world_data;
+    if (IsJsonWorldFilePath(db_path))
     {
-        return false;
+        std::ifstream input(db_path);
+        if (!input.is_open())
+        {
+            return false;
+        }
+
+        std::ostringstream json_stream;
+        json_stream << input.rdbuf();
+
+        google::protobuf::util::JsonParseOptions parse_options;
+        parse_options.ignore_unknown_fields = false;
+        const auto status =
+            google::protobuf::util::JsonStringToMessage(json_stream.str(), &world_data, parse_options);
+        if (!status.ok())
+        {
+            return false;
+        }
+    }
+    else
+    {
+        std::ifstream input(db_path, std::ios::binary);
+        if (!input.is_open())
+        {
+            return false;
+        }
+
+        if (!world_data.ParseFromIstream(&input))
+        {
+            return false;
+        }
     }
 
-    mud::v1::SquareMapData map_data;
-    if (!map_data.ParseFromIstream(&input))
-    {
-        return false;
-    }
-
-    if (map_data.squares().empty())
+    if (world_data.squares().empty())
     {
         return false;
     }
 
     squares_.clear();
+    players_.clear();
+    npcs_.clear();
+    next_player_id_ = 1;
+    next_npc_id_ = 1;
     map_width_ = 0;
     map_height_ = 0;
 
-    for (const auto& record : map_data.squares())
+    for (const auto& record : world_data.squares())
     {
         if (record.square_id().empty())
         {
@@ -991,10 +1117,6 @@ bool WorldState::LoadMapDataFromDisk()
         {
             square.kind = SquareKind::kWall;
         }
-        square.open_north = record.open_north();
-        square.open_east = record.open_east();
-        square.open_south = record.open_south();
-        square.open_west = record.open_west();
         square.description = record.description();
         if (square.description.empty())
         {
@@ -1008,10 +1130,113 @@ bool WorldState::LoadMapDataFromDisk()
         map_height_ = std::max(map_height_, square.y + 1);
     }
 
-    return !squares_.empty();
+    if (squares_.empty())
+    {
+        return false;
+    }
+
+    BuildCoordinateIndex();
+
+    if (world_data.next_player_id() > 0)
+    {
+        next_player_id_ = world_data.next_player_id();
+    }
+
+    if (world_data.next_npc_id() > 0)
+    {
+        next_npc_id_ = world_data.next_npc_id();
+    }
+
+    std::uint64_t max_player_suffix = 0;
+    for (const auto& record : world_data.players())
+    {
+        if (record.player_id().empty() || record.square_id().empty())
+        {
+            continue;
+        }
+
+        auto square_it = squares_.find(record.square_id());
+        if (square_it == squares_.end())
+        {
+            continue;
+        }
+
+        if (players_.find(record.player_id()) != players_.end())
+        {
+            continue;
+        }
+
+        Player player;
+        player.id = record.player_id();
+        player.name = record.name();
+        player.square_id = record.square_id();
+        player.facing = ToFacingDirection(record.facing());
+        player.guarding = record.guarding();
+        player.alive = record.alive();
+        player.hp = std::max(0, record.hp());
+
+        if (player.alive)
+        {
+            if (player.hp <= 0)
+            {
+                player.hp = kPlayerMaxHp;
+            }
+            player.respawn_ready_at = std::chrono::steady_clock::time_point::min();
+        }
+        else
+        {
+            player.hp = 0;
+            player.guarding = false;
+            const int seconds = std::max(0, record.respawn_seconds_remaining());
+            player.respawn_ready_at =
+                std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+        }
+
+        players_[player.id] = player;
+        max_player_suffix = std::max(max_player_suffix, ParseIdSuffix(player.id, "player-"));
+    }
+
+    std::uint64_t max_npc_suffix = 0;
+    for (const auto& record : world_data.npcs())
+    {
+        if (record.npc_id().empty() || record.square_id().empty())
+        {
+            continue;
+        }
+
+        auto square_it = squares_.find(record.square_id());
+        if (square_it == squares_.end() || square_it->second.kind == SquareKind::kWall)
+        {
+            continue;
+        }
+
+        if (npcs_.find(record.npc_id()) != npcs_.end())
+        {
+            continue;
+        }
+
+        Npc npc;
+        npc.id = record.npc_id();
+        npc.name = record.name();
+        npc.square_id = record.square_id();
+        npc.facing = ToFacingDirection(record.facing());
+        npc.hp = std::max(0, record.hp());
+        if (npc.hp <= 0)
+        {
+            continue;
+        }
+
+        npcs_[npc.id] = npc;
+        max_npc_suffix = std::max(max_npc_suffix, ParseIdSuffix(npc.id, "npc-"));
+    }
+
+    next_player_id_ = std::max(next_player_id_, max_player_suffix + 1);
+    next_npc_id_ = std::max(next_npc_id_, max_npc_suffix + 1);
+
+    return true;
 }
 
-bool WorldState::SaveMapDataToDisk() const
+bool WorldState::SaveMapDataToDiskUnlocked() const
 {
     std::filesystem::path db_path(map_db_path_);
     if (db_path.has_parent_path())
@@ -1019,7 +1244,8 @@ bool WorldState::SaveMapDataToDisk() const
         std::filesystem::create_directories(db_path.parent_path());
     }
 
-    mud::v1::SquareMapData map_data;
+    mud::v1::WorldData world_data;
+    world_data.set_schema_version(1);
 
     std::vector<std::string> ids;
     ids.reserve(squares_.size());
@@ -1033,25 +1259,140 @@ bool WorldState::SaveMapDataToDisk() const
     for (const auto& id : ids)
     {
         const Square& square = squares_.at(id);
-        auto* record = map_data.add_squares();
+        auto* record = world_data.add_squares();
         record->set_square_id(square.id);
         record->set_x(square.x);
         record->set_y(square.y);
-        record->set_open_north(square.open_north);
-        record->set_open_east(square.open_east);
-        record->set_open_south(square.open_south);
-        record->set_open_west(square.open_west);
         record->set_description(square.description);
         record->set_kind(square.kind == SquareKind::kWall ? mud::v1::SQUARE_KIND_WALL
                                                           : mud::v1::SQUARE_KIND_FLOOR);
     }
 
-    std::ofstream output(db_path, std::ios::binary | std::ios::trunc);
-    if (!output.is_open())
+    std::vector<std::string> player_ids;
+    player_ids.reserve(players_.size());
+    for (const auto& [id, player] : players_)
     {
+        (void)player;
+        player_ids.push_back(id);
+    }
+    std::sort(player_ids.begin(), player_ids.end());
+
+    for (const auto& player_id : player_ids)
+    {
+        const Player& player = players_.at(player_id);
+        auto* record = world_data.add_players();
+        record->set_player_id(player.id);
+        record->set_name(player.name);
+        record->set_square_id(player.square_id);
+        record->set_facing(ToProtoDirection(player.facing));
+        record->set_hp(player.hp);
+        record->set_alive(player.alive);
+        record->set_guarding(player.guarding);
+        record->set_respawn_seconds_remaining(RespawnSecondsRemaining(player));
+    }
+
+    std::vector<std::string> npc_ids;
+    npc_ids.reserve(npcs_.size());
+    for (const auto& [id, npc] : npcs_)
+    {
+        (void)npc;
+        npc_ids.push_back(id);
+    }
+    std::sort(npc_ids.begin(), npc_ids.end());
+
+    for (const auto& npc_id : npc_ids)
+    {
+        const Npc& npc = npcs_.at(npc_id);
+        auto* record = world_data.add_npcs();
+        record->set_npc_id(npc.id);
+        record->set_name(npc.name);
+        record->set_square_id(npc.square_id);
+        record->set_facing(ToProtoDirection(npc.facing));
+        record->set_hp(npc.hp);
+    }
+
+    world_data.set_next_player_id(next_player_id_);
+    world_data.set_next_npc_id(next_npc_id_);
+
+    const std::filesystem::path temp_path = db_path.string() + ".tmp";
+
+    if (IsJsonWorldFilePath(db_path))
+    {
+        google::protobuf::util::JsonPrintOptions print_options;
+        print_options.add_whitespace = true;
+        print_options.preserve_proto_field_names = true;
+
+        std::string json_output;
+        const auto status =
+            google::protobuf::util::MessageToJsonString(world_data, &json_output, print_options);
+        if (!status.ok())
+        {
+            return false;
+        }
+
+        std::ofstream output(temp_path, std::ios::trunc);
+        if (!output.is_open())
+        {
+            return false;
+        }
+
+        output << json_output;
+        output.flush();
+        if (!output.good())
+        {
+            return false;
+        }
+        output.close();
+    }
+    else
+    {
+        std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
+        if (!output.is_open())
+        {
+            return false;
+        }
+
+        if (!world_data.SerializeToOstream(&output))
+        {
+            return false;
+        }
+
+        output.flush();
+        if (!output.good())
+        {
+            return false;
+        }
+        output.close();
+    }
+
+    std::error_code exists_error;
+    const bool db_exists = std::filesystem::exists(db_path, exists_error);
+    if (exists_error)
+    {
+        std::filesystem::remove(temp_path);
         return false;
     }
-    return map_data.SerializeToOstream(&output);
+
+    if (db_exists)
+    {
+        std::error_code remove_error;
+        std::filesystem::remove(db_path, remove_error);
+        if (remove_error)
+        {
+            std::filesystem::remove(temp_path);
+            return false;
+        }
+    }
+
+    std::error_code rename_error;
+    std::filesystem::rename(temp_path, db_path, rename_error);
+    if (rename_error)
+    {
+        std::filesystem::remove(temp_path);
+        return false;
+    }
+
+    return true;
 }
 
 void WorldState::CreateDefaultMapData()
@@ -1162,6 +1503,11 @@ void WorldState::BuildCoordinateIndex()
 
 void WorldState::SpawnDefaultNpcs()
 {
+    if (!npcs_.empty())
+    {
+        return;
+    }
+
     npcs_.clear();
 
     const auto add_npc = [&](const std::string& name, int x, int y)
@@ -1297,55 +1643,86 @@ bool WorldState::HasLineOfSight(const Square& from, const Square& to) const
         return true;
     }
 
-    const int sample_count = span * 24;
-    const double start_x = static_cast<double>(from.x) + 0.5;
-    const double start_y = static_cast<double>(from.y) + 0.5;
-    const double ray_x = static_cast<double>(dx_cells);
-    const double ray_y = static_cast<double>(dy_cells);
+    int x = from.x;
+    int y = from.y;
 
-    int current_x = from.x;
-    int current_y = from.y;
-    bool reached_target = false;
+    const int step_x = (dx_cells > 0) ? 1 : (dx_cells < 0 ? -1 : 0);
+    const int step_y = (dy_cells > 0) ? 1 : (dy_cells < 0 ? -1 : 0);
+    const int nx = std::abs(dx_cells);
+    const int ny = std::abs(dy_cells);
+    int ix = 0;
+    int iy = 0;
 
-    for (int i = 1; i <= sample_count; ++i)
+    const auto square_at = [&](int cx, int cy) -> const Square*
     {
-        const double t = static_cast<double>(i) / static_cast<double>(sample_count);
-        const int sample_x = static_cast<int>(std::floor(start_x + (ray_x * t)));
-        const int sample_y = static_cast<int>(std::floor(start_y + (ray_y * t)));
-
-        if (sample_x == current_x && sample_y == current_y)
-        {
-            continue;
-        }
-
-        auto coord_it = coordinate_index_.find(CoordinateKey(sample_x, sample_y));
+        auto coord_it = coordinate_index_.find(CoordinateKey(cx, cy));
         if (coord_it == coordinate_index_.end())
         {
-            return false;
+            return nullptr;
+        }
+        auto square_it = squares_.find(coord_it->second);
+        return (square_it == squares_.end()) ? nullptr : &square_it->second;
+    };
+
+    while (ix < nx || iy < ny)
+    {
+        const int lhs = (1 + 2 * ix) * ny;
+        const int rhs = (1 + 2 * iy) * nx;
+
+        if (lhs < rhs)
+        {
+            x += step_x;
+            ++ix;
+        }
+        else if (lhs > rhs)
+        {
+            y += step_y;
+            ++iy;
+        }
+        else
+        {
+            const int side_x = x + step_x;
+            const int side_y = y;
+            const int side2_x = x;
+            const int side2_y = y + step_y;
+
+            const Square* s1 = square_at(side_x, side_y);
+            const Square* s2 = square_at(side2_x, side2_y);
+            const bool s1_wall = (s1 != nullptr && s1->kind == SquareKind::kWall &&
+                                  !(side_x == to.x && side_y == to.y));
+            const bool s2_wall = (s2 != nullptr && s2->kind == SquareKind::kWall &&
+                                  !(side2_x == to.x && side2_y == to.y));
+            // When a ray crosses exactly through a corner, allow visibility if at least
+            // one side of that corner is open. Only a fully blocked corner blocks LOS.
+            if (s1_wall && s2_wall)
+            {
+                return false;
+            }
+
+            x += step_x;
+            y += step_y;
+            ++ix;
+            ++iy;
         }
 
-        auto square_it = squares_.find(coord_it->second);
-        if (square_it == squares_.end())
+        const Square* sample = square_at(x, y);
+        if (sample == nullptr)
         {
             return false;
         }
 
-        const bool is_target = (sample_x == to.x && sample_y == to.y);
-        if (square_it->second.kind == SquareKind::kWall)
+        const bool is_target = (x == to.x && y == to.y);
+        if (sample->kind == SquareKind::kWall)
         {
             return is_target;
         }
-
-        current_x = sample_x;
-        current_y = sample_y;
         if (is_target)
         {
-            reached_target = true;
-            break;
+            return true;
         }
     }
 
-    return reached_target;
+    return x == to.x && y == to.y;
 }
 
 std::unordered_map<std::string, int> WorldState::DistancesFrom(const std::string& origin_square_id,

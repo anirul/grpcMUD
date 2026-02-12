@@ -45,13 +45,8 @@ bool GrpcSession::Connect(const std::string& server_address, const std::string& 
     return true;
 }
 
-bool GrpcSession::SendCommand(const std::string& request_id, const std::string& command_text)
+bool GrpcSession::SendClientMessage(const mud::v1::ClientMessage& message)
 {
-    mud::v1::ClientMessage message;
-    auto* command = message.mutable_command();
-    command->set_request_id(request_id);
-    command->set_text(command_text);
-
     std::lock_guard<std::mutex> lock(write_mutex_);
     if (!stream_)
     {
@@ -64,13 +59,7 @@ bool GrpcSession::SendPing()
 {
     mud::v1::ClientMessage message;
     message.mutable_ping();
-
-    std::lock_guard<std::mutex> lock(write_mutex_);
-    if (!stream_)
-    {
-        return false;
-    }
-    return stream_->Write(message);
+    return SendClientMessage(message);
 }
 
 void GrpcSession::StartReader(std::function<void(const mud::v1::ServerMessage&)> on_message,
@@ -123,4 +112,3 @@ bool GrpcSession::IsOpen() const
     return open_.load(std::memory_order_relaxed);
 }
 } // namespace grpcmud::client
-

@@ -2,7 +2,7 @@
 
 #include <string>
 
-#include "mud.pb.h"
+#include "gameplay.pb.h"
 
 namespace grpcmud::client
 {
@@ -12,4 +12,3 @@ public:
     static std::string Render(const mud::v1::LocalViewUpdate& view);
 };
 } // namespace grpcmud::client
-

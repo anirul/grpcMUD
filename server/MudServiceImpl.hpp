@@ -3,24 +3,30 @@
 #include <grpcpp/grpcpp.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "ClientSession.hpp"
 #include "WorldState.hpp"
-#include "mud.grpc.pb.h"
+#include "gameplay.grpc.pb.h"
 
 namespace grpcmud::server
 {
 class MudServiceImpl final : public mud::v1::MudService::Service
 {
 public:
-    explicit MudServiceImpl(const std::string& map_db_path = "data/world_map.pb");
+    explicit MudServiceImpl(const std::string& map_db_path = "data/world_state.json",
+                            std::chrono::seconds autosave_interval = std::chrono::seconds(60),
+                            std::chrono::milliseconds tick_interval = std::chrono::milliseconds(500));
+    ~MudServiceImpl();
 
     grpc::Status Play(
         grpc::ServerContext* context,
@@ -29,8 +35,6 @@ public:
 private:
     static std::uint64_t NowMs();
     static std::string Trim(const std::string& text);
-    static std::string ToLower(std::string text);
-    static std::pair<std::string, std::string> SplitCommand(const std::string& text);
     static std::string NormalizePeerAddress(const std::string& peer);
 
     mud::v1::ServerMessage MakeBaseMessage(std::uint64_t tick_id) const;
@@ -57,6 +61,8 @@ private:
     void BroadcastSay(const PlayerSnapshot& speaker, const std::string& text, std::uint64_t tick_id);
     void LogConnectionAdded(const std::string& peer_address);
     void LogConnectionRemoved(const std::string& peer_address);
+    void StartAutosaveTask();
+    void StopAutosaveTask();
 
     WorldState world_;
     std::atomic<std::uint64_t> tick_counter_{0};
@@ -67,7 +73,16 @@ private:
     std::mutex sessions_mutex_;
     std::unordered_map<std::string, std::weak_ptr<ClientSession>> sessions_;
     const int say_range_squares_ = 3;
-    const int view_radius_squares_ = 2;
+    const int view_front_squares_ = 3;
+    const int view_back_squares_ = 1;
+    const int view_side_squares_ = 2;
     const int first_person_depth_squares_ = 2;
+
+    std::chrono::seconds autosave_interval_;
+    std::chrono::milliseconds tick_interval_;
+    std::atomic<bool> autosave_stop_{false};
+    std::mutex autosave_mutex_;
+    std::condition_variable autosave_cv_;
+    std::thread autosave_thread_;
 };
 } // namespace grpcmud::server

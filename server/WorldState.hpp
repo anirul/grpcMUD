@@ -158,7 +158,8 @@ struct AttackResult
 class WorldState
 {
 public:
-    explicit WorldState(std::string map_db_path = "data/world_map.pb");
+    explicit WorldState(std::string map_db_path = "data/world_state.json");
+    bool SaveMapToDisk() const;
 
     PlayerSnapshot AddPlayer(const std::string& requested_name);
     void RemovePlayer(const std::string& player_id);
@@ -172,7 +173,8 @@ public:
     std::optional<PlayerSnapshot> RespawnPlayerIfReady(const std::string& player_id);
 
     std::string DescribeSquareForPlayer(const std::string& player_id) const;
-    std::optional<LocalView> BuildLocalView(const std::string& player_id, int radius) const;
+    std::optional<LocalView> BuildLocalView(const std::string& player_id, int front_depth,
+                                            int back_depth, int side_depth) const;
     std::optional<FirstPersonView> BuildFirstPersonView(const std::string& player_id,
                                                         int max_depth) const;
     std::vector<NearbyPlayer> GetPlayersWithinRange(const std::string& origin_square_id,
@@ -221,7 +223,7 @@ private:
     static std::string Join(const std::vector<std::string>& items, const std::string& delimiter);
 
     bool LoadMapDataFromDisk();
-    bool SaveMapDataToDisk() const;
+    bool SaveMapDataToDiskUnlocked() const;
     void CreateDefaultMapData();
     void RecomputeOpenEdgesFromWalls();
     bool HasWallSquares() const;

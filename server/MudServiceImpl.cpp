@@ -1,8 +1,6 @@
 #include "MudServiceImpl.hpp"
 
-#include <algorithm>
 #include <chrono>
-#include <cctype>
 #include <iostream>
 #include <limits>
 #include <thread>
@@ -95,8 +93,19 @@ mud::v1::SquareKind ToProtoSquareKind(SquareKind kind)
 }
 } // namespace
 
-MudServiceImpl::MudServiceImpl(const std::string& map_db_path) : world_(map_db_path)
+MudServiceImpl::MudServiceImpl(const std::string& map_db_path,
+                               std::chrono::seconds autosave_interval,
+                               std::chrono::milliseconds tick_interval)
+    : world_(map_db_path),
+      autosave_interval_(autosave_interval),
+      tick_interval_(tick_interval)
 {
+    StartAutosaveTask();
+}
+
+MudServiceImpl::~MudServiceImpl()
+{
+    StopAutosaveTask();
 }
 
 grpc::Status MudServiceImpl::Play(
@@ -118,7 +127,7 @@ grpc::Status MudServiceImpl::Play(
     {
         while (!done.load(std::memory_order_relaxed))
         {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::this_thread::sleep_for(tick_interval_);
             if (done.load(std::memory_order_relaxed))
             {
                 break;
@@ -173,6 +182,58 @@ grpc::Status MudServiceImpl::Play(
     while (!done.load(std::memory_order_relaxed) && stream->Read(&in))
     {
         const std::uint64_t current_tick = tick_counter_.load();
+        const auto prepare_action = [&](const std::string& request_id) -> bool
+        {
+            if (!joined)
+            {
+                if (!SendAck(session, current_tick, request_id, false,
+                             "Join first before sending actions."))
+                {
+                    done.store(true, std::memory_order_relaxed);
+                }
+                return false;
+            }
+
+            const auto respawned = world_.RespawnPlayerIfReady(player.player_id);
+            if (respawned)
+            {
+                player = *respawned;
+                if (!SendWorldEvent(session, current_tick, mud::v1::WorldEvent::KIND_SYSTEM,
+                                    "You respawn and return to battle.", player.square_id,
+                                    player.player_id))
+                {
+                    done.store(true, std::memory_order_relaxed);
+                    return false;
+                }
+
+                if (!SendWorldEvent(session, current_tick, mud::v1::WorldEvent::KIND_ROOM,
+                                    world_.DescribeSquareForPlayer(player.player_id),
+                                    player.square_id, player.player_id))
+                {
+                    done.store(true, std::memory_order_relaxed);
+                    return false;
+                }
+
+                if (!SendViewUpdate(session, current_tick, player.player_id))
+                {
+                    done.store(true, std::memory_order_relaxed);
+                    return false;
+                }
+            }
+
+            const auto respawn_seconds = world_.GetRespawnSecondsRemaining(player.player_id);
+            if (respawn_seconds && *respawn_seconds > 0)
+            {
+                if (!SendAck(session, current_tick, request_id, false,
+                             "You are knocked out. Respawn in " +
+                                 std::to_string(*respawn_seconds) + " second(s)."))
+                {
+                    done.store(true, std::memory_order_relaxed);
+                }
+                return false;
+            }
+            return true;
+        };
 
         switch (in.payload_case())
         {
@@ -206,9 +267,8 @@ grpc::Status MudServiceImpl::Play(
             mud::v1::ServerMessage join_ack = MakeBaseMessage(current_tick);
             auto* ack = join_ack.mutable_join_ack();
             ack->set_player_id(player.player_id);
-            ack->set_motd("Welcome to Quest Board PvP. Commands: look, "
-                          "move <forward|backward|dir>, turn <left|right|dir>, "
-                          "guard, say <text>, attack <melee|ranged>, /ping");
+            ack->set_motd("Welcome to Quest Board PvP. Actions: look, step(move/turn), "
+                          "guard, say <text>, attack <melee|ranged>, ping.");
             if (!session->Write(std::move(join_ack)))
             {
                 done.store(true, std::memory_order_relaxed);
@@ -237,113 +297,64 @@ grpc::Status MudServiceImpl::Play(
             }
             break;
         }
-        case mud::v1::ClientMessage::kCommand:
+        case mud::v1::ClientMessage::kLook:
         {
-            const std::string request_id = in.command().request_id().empty()
-                                               ? "missing-request-id"
-                                               : in.command().request_id();
-            const std::string command_text = Trim(in.command().text());
+            const std::string request_id =
+                in.look().request_id().empty() ? "missing-request-id" : in.look().request_id();
+            if (!prepare_action(request_id))
+            {
+                break;
+            }
 
-            if (!joined)
+            if (!SendAck(session, current_tick, request_id, true, "ok"))
+            {
+                done.store(true, std::memory_order_relaxed);
+                break;
+            }
+
+            const auto fresh_player = world_.GetPlayer(player.player_id);
+            const std::string square_id = fresh_player ? fresh_player->square_id : std::string{};
+            if (!SendWorldEvent(session, current_tick, mud::v1::WorldEvent::KIND_ROOM,
+                                world_.DescribeSquareForPlayer(player.player_id), square_id,
+                                player.player_id))
+            {
+                done.store(true, std::memory_order_relaxed);
+                break;
+            }
+
+            if (!SendViewUpdate(session, current_tick, player.player_id))
+            {
+                done.store(true, std::memory_order_relaxed);
+            }
+            break;
+        }
+        case mud::v1::ClientMessage::kStep:
+        {
+            const auto& step = in.step();
+            const std::string request_id =
+                step.request_id().empty() ? "missing-request-id" : step.request_id();
+            if (!prepare_action(request_id))
+            {
+                break;
+            }
+
+            if (current_tick == last_move_or_turn_tick)
             {
                 if (!SendAck(session, current_tick, request_id, false,
-                             "Join first before sending commands."))
+                             "Only one move/turn command is allowed per tick."))
                 {
                     done.store(true, std::memory_order_relaxed);
                 }
                 break;
             }
 
-            if (command_text.empty())
+            if (step.kind() == mud::v1::STEP_KIND_MOVE_FORWARD ||
+                step.kind() == mud::v1::STEP_KIND_MOVE_BACKWARD)
             {
-                if (!SendAck(session, current_tick, request_id, false, "Command text is empty."))
-                {
-                    done.store(true, std::memory_order_relaxed);
-                }
-                break;
-            }
-
-            const auto respawned = world_.RespawnPlayerIfReady(player.player_id);
-            if (respawned)
-            {
-                player = *respawned;
-                if (!SendWorldEvent(session, current_tick, mud::v1::WorldEvent::KIND_SYSTEM,
-                                    "You respawn and return to battle.", player.square_id,
-                                    player.player_id))
-                {
-                    done.store(true, std::memory_order_relaxed);
-                    break;
-                }
-
-                if (!SendWorldEvent(session, current_tick, mud::v1::WorldEvent::KIND_ROOM,
-                                    world_.DescribeSquareForPlayer(player.player_id),
-                                    player.square_id, player.player_id))
-                {
-                    done.store(true, std::memory_order_relaxed);
-                    break;
-                }
-
-                if (!SendViewUpdate(session, current_tick, player.player_id))
-                {
-                    done.store(true, std::memory_order_relaxed);
-                    break;
-                }
-            }
-
-            const auto respawn_seconds = world_.GetRespawnSecondsRemaining(player.player_id);
-            if (respawn_seconds && *respawn_seconds > 0)
-            {
-                if (!SendAck(session, current_tick, request_id, false,
-                             "You are knocked out. Respawn in " +
-                                 std::to_string(*respawn_seconds) + " second(s)."))
-                {
-                    done.store(true, std::memory_order_relaxed);
-                }
-                break;
-            }
-
-            const auto [verb, argument] = SplitCommand(command_text);
-
-            if (verb == "look")
-            {
-                if (!SendAck(session, current_tick, request_id, true, "ok"))
-                {
-                    done.store(true, std::memory_order_relaxed);
-                    break;
-                }
-
-                const auto fresh_player = world_.GetPlayer(player.player_id);
-                const std::string square_id =
-                    fresh_player ? fresh_player->square_id : std::string{};
-                if (!SendWorldEvent(session, current_tick, mud::v1::WorldEvent::KIND_ROOM,
-                                    world_.DescribeSquareForPlayer(player.player_id), square_id,
-                                    player.player_id))
-                {
-                    done.store(true, std::memory_order_relaxed);
-                    break;
-                }
-
-                if (!SendViewUpdate(session, current_tick, player.player_id))
-                {
-                    done.store(true, std::memory_order_relaxed);
-                }
-                break;
-            }
-
-            if (verb == "move")
-            {
-                if (current_tick == last_move_or_turn_tick)
-                {
-                    if (!SendAck(session, current_tick, request_id, false,
-                                 "Only one move/turn command is allowed per tick."))
-                    {
-                        done.store(true, std::memory_order_relaxed);
-                    }
-                    break;
-                }
                 last_move_or_turn_tick = current_tick;
-
-                const MoveResult move = world_.MovePlayer(player.player_id, argument);
+                const std::string move_arg =
+                    (step.kind() == mud::v1::STEP_KIND_MOVE_FORWARD) ? "forward" : "backward";
+                const MoveResult move = world_.MovePlayer(player.player_id, move_arg);
                 if (!move.success)
                 {
                     if (!SendAck(session, current_tick, request_id, false, move.message))
@@ -374,20 +385,13 @@ grpc::Status MudServiceImpl::Play(
                 break;
             }
 
-            if (verb == "turn")
+            if (step.kind() == mud::v1::STEP_KIND_TURN_LEFT ||
+                step.kind() == mud::v1::STEP_KIND_TURN_RIGHT)
             {
-                if (current_tick == last_move_or_turn_tick)
-                {
-                    if (!SendAck(session, current_tick, request_id, false,
-                                 "Only one move/turn command is allowed per tick."))
-                    {
-                        done.store(true, std::memory_order_relaxed);
-                    }
-                    break;
-                }
                 last_move_or_turn_tick = current_tick;
-
-                const TurnResult turn = world_.TurnPlayer(player.player_id, argument);
+                const std::string turn_arg =
+                    (step.kind() == mud::v1::STEP_KIND_TURN_LEFT) ? "left" : "right";
+                const TurnResult turn = world_.TurnPlayer(player.player_id, turn_arg);
                 if (!turn.success)
                 {
                     if (!SendAck(session, current_tick, request_id, false, turn.message))
@@ -404,8 +408,7 @@ grpc::Status MudServiceImpl::Play(
                 }
 
                 const auto fresh_player = world_.GetPlayer(player.player_id);
-                const std::string square_id =
-                    fresh_player ? fresh_player->square_id : std::string{};
+                const std::string square_id = fresh_player ? fresh_player->square_id : std::string{};
                 if (!SendWorldEvent(session, current_tick, mud::v1::WorldEvent::KIND_SYSTEM,
                                     "You now face " + FacingDirectionToString(turn.facing) + ".",
                                     square_id, player.player_id))
@@ -421,163 +424,176 @@ grpc::Status MudServiceImpl::Play(
                 break;
             }
 
-            if (verb == "say")
-            {
-                if (argument.empty())
-                {
-                    if (!SendAck(session, current_tick, request_id, false, "Usage: say <text>"))
-                    {
-                        done.store(true, std::memory_order_relaxed);
-                    }
-                    break;
-                }
-
-                if (!SendAck(session, current_tick, request_id, true, "ok"))
-                {
-                    done.store(true, std::memory_order_relaxed);
-                    break;
-                }
-
-                const auto speaker = world_.GetPlayer(player.player_id);
-                if (speaker)
-                {
-                    BroadcastSay(*speaker, argument, current_tick);
-                }
-                break;
-            }
-
-            if (verb == "guard")
-            {
-                const GuardResult guard = world_.GuardPlayer(player.player_id);
-                if (!guard.success)
-                {
-                    if (!SendAck(session, current_tick, request_id, false, guard.message))
-                    {
-                        done.store(true, std::memory_order_relaxed);
-                    }
-                    break;
-                }
-
-                if (!SendAck(session, current_tick, request_id, true, "ok"))
-                {
-                    done.store(true, std::memory_order_relaxed);
-                    break;
-                }
-
-                const auto fresh_player = world_.GetPlayer(player.player_id);
-                const std::string square_id =
-                    fresh_player ? fresh_player->square_id : std::string{};
-                if (!SendWorldEvent(session, current_tick, mud::v1::WorldEvent::KIND_SYSTEM,
-                                    "You raise your guard toward " +
-                                        FacingDirectionToString(guard.facing) + ".",
-                                    square_id, player.player_id))
-                {
-                    done.store(true, std::memory_order_relaxed);
-                    break;
-                }
-
-                if (!SendViewUpdate(session, current_tick, player.player_id))
-                {
-                    done.store(true, std::memory_order_relaxed);
-                }
-                break;
-            }
-
-            if (verb == "attack")
-            {
-                WeaponType weapon = WeaponType::kMelee;
-                if (!argument.empty())
-                {
-                    const std::string normalized = ToLower(argument);
-                    if (normalized == "melee" || normalized == "m")
-                    {
-                        weapon = WeaponType::kMelee;
-                    }
-                    else if (normalized == "ranged" || normalized == "range" || normalized == "r")
-                    {
-                        weapon = WeaponType::kRanged;
-                    }
-                    else
-                    {
-                        if (!SendAck(session, current_tick, request_id, false,
-                                     "Usage: attack <melee|ranged>"))
-                        {
-                            done.store(true, std::memory_order_relaxed);
-                        }
-                        break;
-                    }
-                }
-
-                if (weapon == WeaponType::kRanged)
-                {
-                    if (current_tick < next_ranged_attack_ready_tick)
-                    {
-                        const std::uint64_t ticks_remaining =
-                            next_ranged_attack_ready_tick - current_tick;
-                        if (!SendAck(session, current_tick, request_id, false,
-                                     "Ranged attack reloading. Ready in " +
-                                         std::to_string(ticks_remaining) + " tick(s)."))
-                        {
-                            done.store(true, std::memory_order_relaxed);
-                        }
-                        break;
-                    }
-                    next_ranged_attack_ready_tick = current_tick + 2;
-                }
-
-                const AttackResult attack = world_.AttackInFacing(player.player_id, weapon);
-                if (!attack.success)
-                {
-                    if (!SendAck(session, current_tick, request_id, false, attack.message))
-                    {
-                        done.store(true, std::memory_order_relaxed);
-                    }
-                    break;
-                }
-
-                if (!SendAck(session, current_tick, request_id, true, "ok"))
-                {
-                    done.store(true, std::memory_order_relaxed);
-                    break;
-                }
-
-                const std::string attacker_message =
-                    attack.attacker_message.empty() ? attack.message : attack.attacker_message;
-                if (!SendWorldEvent(session, current_tick, mud::v1::WorldEvent::KIND_COMBAT,
-                                    attacker_message, attack.attacker_square_id,
-                                    attack.attacker_id))
-                {
-                    done.store(true, std::memory_order_relaxed);
-                    break;
-                }
-
-                if (!SendViewUpdate(session, current_tick, player.player_id))
-                {
-                    done.store(true, std::memory_order_relaxed);
-                    break;
-                }
-
-                if (attack.target_is_player && attack.target_id != player.player_id &&
-                    !attack.target_message.empty())
-                {
-                    const auto target_session = GetSession(attack.target_id);
-                    if (target_session)
-                    {
-                        SendWorldEvent(target_session, current_tick, mud::v1::WorldEvent::KIND_COMBAT,
-                                       attack.target_message, attack.target_square_id,
-                                       attack.attacker_id);
-                        SendViewUpdate(target_session, current_tick, attack.target_id);
-                    }
-                }
-                break;
-            }
-
-            if (!SendAck(session, current_tick, request_id, false,
-                         "Unknown command. Try: look, move <forward|backward|dir>, "
-                         "turn <left|right|dir>, guard, say <text>, "
-                         "attack <melee|ranged>."))
+            if (!SendAck(session, current_tick, request_id, false, "Invalid step kind."))
             {
                 done.store(true, std::memory_order_relaxed);
+            }
+            break;
+        }
+        case mud::v1::ClientMessage::kSay:
+        {
+            const auto& say = in.say();
+            const std::string request_id =
+                say.request_id().empty() ? "missing-request-id" : say.request_id();
+            if (!prepare_action(request_id))
+            {
+                break;
+            }
+
+            const std::string text = Trim(say.text());
+            if (text.empty())
+            {
+                if (!SendAck(session, current_tick, request_id, false, "Usage: say <text>"))
+                {
+                    done.store(true, std::memory_order_relaxed);
+                }
+                break;
+            }
+
+            if (!SendAck(session, current_tick, request_id, true, "ok"))
+            {
+                done.store(true, std::memory_order_relaxed);
+                break;
+            }
+
+            const auto speaker = world_.GetPlayer(player.player_id);
+            if (speaker)
+            {
+                BroadcastSay(*speaker, text, current_tick);
+            }
+            break;
+        }
+        case mud::v1::ClientMessage::kGuard:
+        {
+            const auto& guard_req = in.guard();
+            const std::string request_id =
+                guard_req.request_id().empty() ? "missing-request-id" : guard_req.request_id();
+            if (!prepare_action(request_id))
+            {
+                break;
+            }
+
+            const GuardResult guard = world_.GuardPlayer(player.player_id);
+            if (!guard.success)
+            {
+                if (!SendAck(session, current_tick, request_id, false, guard.message))
+                {
+                    done.store(true, std::memory_order_relaxed);
+                }
+                break;
+            }
+
+            if (!SendAck(session, current_tick, request_id, true, "ok"))
+            {
+                done.store(true, std::memory_order_relaxed);
+                break;
+            }
+
+            const auto fresh_player = world_.GetPlayer(player.player_id);
+            const std::string square_id = fresh_player ? fresh_player->square_id : std::string{};
+            if (!SendWorldEvent(session, current_tick, mud::v1::WorldEvent::KIND_SYSTEM,
+                                "You raise your guard toward " +
+                                    FacingDirectionToString(guard.facing) + ".",
+                                square_id, player.player_id))
+            {
+                done.store(true, std::memory_order_relaxed);
+                break;
+            }
+
+            if (!SendViewUpdate(session, current_tick, player.player_id))
+            {
+                done.store(true, std::memory_order_relaxed);
+            }
+            break;
+        }
+        case mud::v1::ClientMessage::kAttack:
+        {
+            const auto& attack_req = in.attack();
+            const std::string request_id =
+                attack_req.request_id().empty() ? "missing-request-id" : attack_req.request_id();
+            if (!prepare_action(request_id))
+            {
+                break;
+            }
+
+            WeaponType weapon = WeaponType::kMelee;
+            if (attack_req.weapon() == mud::v1::WEAPON_KIND_MELEE)
+            {
+                weapon = WeaponType::kMelee;
+            }
+            else if (attack_req.weapon() == mud::v1::WEAPON_KIND_RANGED)
+            {
+                weapon = WeaponType::kRanged;
+            }
+            else
+            {
+                if (!SendAck(session, current_tick, request_id, false,
+                             "Attack weapon is required (melee or ranged)."))
+                {
+                    done.store(true, std::memory_order_relaxed);
+                }
+                break;
+            }
+
+            if (weapon == WeaponType::kRanged)
+            {
+                if (current_tick < next_ranged_attack_ready_tick)
+                {
+                    const std::uint64_t ticks_remaining = next_ranged_attack_ready_tick - current_tick;
+                    if (!SendAck(session, current_tick, request_id, false,
+                                 "Ranged attack reloading. Ready in " +
+                                     std::to_string(ticks_remaining) + " tick(s)."))
+                    {
+                        done.store(true, std::memory_order_relaxed);
+                    }
+                    break;
+                }
+                next_ranged_attack_ready_tick = current_tick + 2;
+            }
+
+            const AttackResult attack = world_.AttackInFacing(player.player_id, weapon);
+            if (!attack.success)
+            {
+                if (!SendAck(session, current_tick, request_id, false, attack.message))
+                {
+                    done.store(true, std::memory_order_relaxed);
+                }
+                break;
+            }
+
+            if (!SendAck(session, current_tick, request_id, true, "ok"))
+            {
+                done.store(true, std::memory_order_relaxed);
+                break;
+            }
+
+            const std::string attacker_message =
+                attack.attacker_message.empty() ? attack.message : attack.attacker_message;
+            if (!SendWorldEvent(session, current_tick, mud::v1::WorldEvent::KIND_COMBAT,
+                                attacker_message, attack.attacker_square_id,
+                                attack.attacker_id))
+            {
+                done.store(true, std::memory_order_relaxed);
+                break;
+            }
+
+            if (!SendViewUpdate(session, current_tick, player.player_id))
+            {
+                done.store(true, std::memory_order_relaxed);
+                break;
+            }
+
+            if (attack.target_is_player && attack.target_id != player.player_id &&
+                !attack.target_message.empty())
+            {
+                const auto target_session = GetSession(attack.target_id);
+                if (target_session)
+                {
+                    SendWorldEvent(target_session, current_tick, mud::v1::WorldEvent::KIND_COMBAT,
+                                   attack.target_message, attack.target_square_id,
+                                   attack.attacker_id);
+                    SendViewUpdate(target_session, current_tick, attack.target_id);
+                }
             }
             break;
         }
@@ -633,26 +649,6 @@ std::string MudServiceImpl::Trim(const std::string& text)
     }
     const auto last = text.find_last_not_of(" \t\r\n");
     return text.substr(first, (last - first) + 1);
-}
-
-std::string MudServiceImpl::ToLower(std::string text)
-{
-    std::transform(text.begin(), text.end(), text.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return text;
-}
-
-std::pair<std::string, std::string> MudServiceImpl::SplitCommand(const std::string& text)
-{
-    const auto split = text.find(' ');
-    if (split == std::string::npos)
-    {
-        return {ToLower(text), {}};
-    }
-
-    const std::string verb = ToLower(text.substr(0, split));
-    const std::string argument = Trim(text.substr(split + 1));
-    return {verb, argument};
 }
 
 std::string MudServiceImpl::NormalizePeerAddress(const std::string& peer)
@@ -728,7 +724,8 @@ bool MudServiceImpl::SendWorldEvent(const std::shared_ptr<ClientSession>& sessio
 bool MudServiceImpl::SendViewUpdate(const std::shared_ptr<ClientSession>& session,
                                     std::uint64_t tick_id, const std::string& player_id) const
 {
-    const auto view = world_.BuildLocalView(player_id, view_radius_squares_);
+    const auto view = world_.BuildLocalView(player_id, view_front_squares_, view_back_squares_,
+                                            view_side_squares_);
     if (!view)
     {
         return false;
@@ -908,5 +905,51 @@ void MudServiceImpl::LogConnectionRemoved(const std::string& peer_address)
     }
     std::cout << connected_clients << "# removed " << peer_address << " from the MUD."
               << std::endl;
+}
+
+void MudServiceImpl::StartAutosaveTask()
+{
+    autosave_thread_ = std::thread([this]()
+    {
+        std::unique_lock<std::mutex> lock(autosave_mutex_);
+
+        while (!autosave_stop_.load(std::memory_order_relaxed))
+        {
+            const bool stop_requested = autosave_cv_.wait_for(
+                lock, autosave_interval_, [this]()
+                {
+                    return autosave_stop_.load(std::memory_order_relaxed);
+                });
+
+            if (stop_requested || autosave_stop_.load(std::memory_order_relaxed))
+            {
+                break;
+            }
+
+            lock.unlock();
+            const bool saved = world_.SaveMapToDisk();
+            if (!saved)
+            {
+                std::cerr << "autosave failed" << std::endl;
+            }
+            lock.lock();
+        }
+    });
+}
+
+void MudServiceImpl::StopAutosaveTask()
+{
+    autosave_stop_.store(true, std::memory_order_relaxed);
+    autosave_cv_.notify_all();
+
+    if (autosave_thread_.joinable())
+    {
+        autosave_thread_.join();
+    }
+
+    if (!world_.SaveMapToDisk())
+    {
+        std::cerr << "final map save failed" << std::endl;
+    }
 }
 } // namespace grpcmud::server

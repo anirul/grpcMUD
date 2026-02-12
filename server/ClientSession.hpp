@@ -4,7 +4,7 @@
 
 #include <mutex>
 
-#include "mud.grpc.pb.h"
+#include "gameplay.grpc.pb.h"
 
 namespace grpcmud::server
 {
@@ -21,4 +21,3 @@ private:
     std::mutex write_mutex_;
 };
 } // namespace grpcmud::server
-

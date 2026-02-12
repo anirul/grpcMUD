@@ -9,7 +9,7 @@
 #include <string>
 #include <thread>
 
-#include "mud.grpc.pb.h"
+#include "gameplay.grpc.pb.h"
 
 namespace grpcmud::client
 {
@@ -21,7 +21,7 @@ public:
 
     bool Connect(const std::string& server_address, const std::string& player_name,
                  std::string* error_message);
-    bool SendCommand(const std::string& request_id, const std::string& command_text);
+    bool SendClientMessage(const mud::v1::ClientMessage& message);
     bool SendPing();
 
     void StartReader(std::function<void(const mud::v1::ServerMessage&)> on_message,
@@ -41,4 +41,3 @@ private:
     std::mutex write_mutex_;
 };
 } // namespace grpcmud::client
-

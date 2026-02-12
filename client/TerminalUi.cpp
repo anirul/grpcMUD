@@ -1,7 +1,16 @@
 #include "TerminalUi.hpp"
 
+#include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <utility>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include "FpsRenderer.hpp"
 #include "MapRenderer.hpp"
@@ -117,13 +126,46 @@ bool TerminalUi::IsRenderMapDebug() const
     return render_map_debug_;
 }
 
+TerminalUi::TerminalSize TerminalUi::DetectTerminalSize()
+{
+    TerminalSize size;
+
+#ifdef _WIN32
+    const HANDLE output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (output_handle != INVALID_HANDLE_VALUE)
+    {
+        CONSOLE_SCREEN_BUFFER_INFO info;
+        if (GetConsoleScreenBufferInfo(output_handle, &info))
+        {
+            size.columns = static_cast<int>(info.srWindow.Right - info.srWindow.Left + 1);
+            size.rows = static_cast<int>(info.srWindow.Bottom - info.srWindow.Top + 1);
+        }
+    }
+#else
+    if (const char* columns = std::getenv("COLUMNS"))
+    {
+        size.columns = std::max(1, std::atoi(columns));
+    }
+    if (const char* rows = std::getenv("LINES"))
+    {
+        size.rows = std::max(1, std::atoi(rows));
+    }
+#endif
+
+    size.columns = std::max(size.columns, 20);
+    size.rows = std::max(size.rows, 10);
+    return size;
+}
+
 void TerminalUi::Render() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    const TerminalSize terminal_size = DetectTerminalSize();
 
     std::cout << "\x1B[2J\x1B[H";
     std::cout << "grpcMUD Tactical Client" << '\n';
     std::cout << "Mode: " << ModeName(mode_) << '\n';
+    std::cout << "Terminal: " << terminal_size.columns << "x" << terminal_size.rows << '\n';
 
     if (death_screen_active_)
     {
@@ -140,7 +182,8 @@ void TerminalUi::Render() const
         std::cout << "View: " << (render_map_debug_ ? "Map (debug)" : "FPS") << '\n';
         if (!render_map_debug_ && view_->has_first_person())
         {
-            std::cout << FpsRenderer::Render(view_->first_person());
+            std::cout << FpsRenderer::Render(view_->first_person(), terminal_size.columns,
+                                             terminal_size.rows);
         }
         else
         {

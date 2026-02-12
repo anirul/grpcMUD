@@ -6,7 +6,7 @@
 
 #include "GrpcSession.hpp"
 #include "TerminalUi.hpp"
-#include "mud.pb.h"
+#include "gameplay.pb.h"
 
 namespace grpcmud::client
 {
@@ -21,13 +21,19 @@ private:
     static std::string ReadPlayerNameFromPrompt();
     static bool IsPrintableChar(int ch);
 
-    bool SendCommandText(const std::string& text);
+    std::string NextRequestId();
+    bool SendMessage(mud::v1::ClientMessage message);
+    bool SendLookRequest();
+    bool SendStepRequest(mud::v1::StepKind kind);
+    bool SendSayRequest(const std::string& text);
+    bool SendGuardRequest();
+    bool SendAttackRequest(mud::v1::WeaponKind weapon);
     void HandleServerMessage(const mud::v1::ServerMessage& message);
     void HandleServerClosed();
     void HandleKeyEvent(int ch);
     void HandleMoveInput(int ch);
     void HandleTextInput(int ch);
-    bool TrySendMoveOrTurnCommand(const std::string& command_text);
+    bool TrySendMoveOrTurnCommand(mud::v1::ClientMessage message);
 
     std::string server_address_;
     std::string player_name_;

@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package mud.v1;
+
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  DIRECTION_NORTH = 1;
+  DIRECTION_EAST = 2;
+  DIRECTION_SOUTH = 3;
+  DIRECTION_WEST = 4;
+}
+
+enum SquareKind {
+  SQUARE_KIND_UNSPECIFIED = 0;
+  SQUARE_KIND_FLOOR = 1;
+  SQUARE_KIND_WALL = 2;
+}
+
+// Persistent world storage for the server-side world database.
+message WorldSquare {
+  string square_id = 1;
+  int32 x = 2;
+  int32 y = 3;
+  SquareKind kind = 4;
+  string description = 5;
+}
+
+message WorldPlayer {
+  string player_id = 1;
+  string name = 2;
+  string square_id = 3;
+  Direction facing = 4;
+  int32 hp = 5;
+  bool alive = 6;
+  bool guarding = 7;
+  int32 respawn_seconds_remaining = 8;
+}
+
+message WorldNpc {
+  string npc_id = 1;
+  string name = 2;
+  string square_id = 3;
+  Direction facing = 4;
+  int32 hp = 5;
+}
+
+message WorldData {
+  uint32 schema_version = 1;
+  repeated WorldSquare squares = 2;
+  repeated WorldPlayer players = 3;
+  repeated WorldNpc npcs = 4;
+  uint64 next_player_id = 5;
+  uint64 next_npc_id = 6;
+}
