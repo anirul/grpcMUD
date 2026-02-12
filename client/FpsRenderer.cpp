@@ -1,6 +1,7 @@
 #include "FpsRenderer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -24,139 +25,350 @@ enum class SurfaceStyle
     kRightOpen,
     kFrontWall,
     kFrontOpen,
-    kFrontUnknown
+    kFrontUnknown,
+    kEdge,
+    kActorSelf,
+    kActorPlayer,
+    kActorNpc
 };
 
-struct Pixel
+enum class CorridorFlag
 {
-    char ch = ' ';
-    SurfaceStyle style = SurfaceStyle::kVoid;
+    kUnknown,
+    kOpen,
+    kWall
 };
 
-struct CorridorState
+struct Rect
 {
-    bool known = false;
-    bool open = false;
+    int left = 0;
+    int right = 0;
+    int top = 0;
+    int bottom = 0;
 };
+
+struct Point
+{
+    int x = 0;
+    int y = 0;
+};
+
+Point LerpPoint(const Point& from, const Point& to, double t)
+{
+    return Point{
+        static_cast<int>(std::lround(static_cast<double>(from.x) +
+                                     static_cast<double>(to.x - from.x) * t)),
+        static_cast<int>(std::lround(static_cast<double>(from.y) +
+                                     static_cast<double>(to.y - from.y) * t)),
+    };
+}
 
 std::int64_t CellKey(int depth, int lane)
 {
     return (static_cast<std::int64_t>(depth) << 32) ^ static_cast<std::uint32_t>(lane + 1024);
 }
 
-char ActorGlyph(mud::v1::VisibleActor::Kind kind)
-{
-    switch (kind)
-    {
-    case mud::v1::VisibleActor::KIND_SELF:
-        return '@';
-    case mud::v1::VisibleActor::KIND_PLAYER:
-        return 'P';
-    case mud::v1::VisibleActor::KIND_NPC:
-        return 'N';
-    case mud::v1::VisibleActor::KIND_UNSPECIFIED:
-    default:
-        return '?';
-    }
-}
-
-char FacingGlyph(mud::v1::Direction direction)
-{
-    switch (direction)
-    {
-    case mud::v1::DIRECTION_NORTH:
-        return '^';
-    case mud::v1::DIRECTION_EAST:
-        return '>';
-    case mud::v1::DIRECTION_SOUTH:
-        return 'v';
-    case mud::v1::DIRECTION_WEST:
-        return '<';
-    case mud::v1::DIRECTION_UNSPECIFIED:
-    default:
-        return '?';
-    }
-}
-
-const char* AnsiForStyle(SurfaceStyle style)
+int StyleColor(SurfaceStyle style)
 {
     switch (style)
     {
     case SurfaceStyle::kVoid:
-        return "\x1b[0m";
+        return 16;
     case SurfaceStyle::kCeiling:
+        return 244;
     case SurfaceStyle::kFloor:
-        return "\x1b[48;5;240m\x1b[38;5;252m";
+        return 240;
     case SurfaceStyle::kLeftWall:
-        return "\x1b[48;5;238m\x1b[38;5;252m";
+        return 62;
     case SurfaceStyle::kLeftOpen:
-        return "\x1b[48;5;235m\x1b[38;5;252m";
+        return 24;
     case SurfaceStyle::kRightWall:
-        return "\x1b[48;5;239m\x1b[38;5;252m";
+        return 96;
     case SurfaceStyle::kRightOpen:
-        return "\x1b[48;5;235m\x1b[38;5;252m";
+        return 53;
     case SurfaceStyle::kFrontWall:
-        return "\x1b[48;5;244m\x1b[38;5;255m";
+        return 246;
     case SurfaceStyle::kFrontOpen:
-        return "\x1b[48;5;236m\x1b[38;5;255m";
+        return 236;
     case SurfaceStyle::kFrontUnknown:
-        return "\x1b[48;5;241m\x1b[38;5;255m";
+        return 239;
+    case SurfaceStyle::kEdge:
+        return 255;
+    case SurfaceStyle::kActorSelf:
+        return 226;
+    case SurfaceStyle::kActorPlayer:
+        return 45;
+    case SurfaceStyle::kActorNpc:
+        return 196;
     }
-    return "\x1b[0m";
+    return 16;
 }
 
-int InterpolateInt(int start, int end, double ratio)
-{
-    return static_cast<int>(std::lround(static_cast<double>(start) +
-                                        (static_cast<double>(end - start) * ratio)));
-}
-
-void DrawLine(std::vector<std::vector<Pixel>>& canvas, int x0, int y0, int x1, int y1, char ch)
+void SetPixel(std::vector<std::vector<SurfaceStyle>>& canvas, int x, int y, SurfaceStyle style)
 {
     const int height = static_cast<int>(canvas.size());
-    if (height == 0)
+    if (height <= 0)
     {
         return;
     }
     const int width = static_cast<int>(canvas[0].size());
-    if (width == 0)
+    if (x < 0 || x >= width || y < 0 || y >= height)
     {
         return;
     }
+    canvas[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)] = style;
+}
 
-    const int dx = x1 - x0;
-    const int dy = y1 - y0;
+void DrawLine(std::vector<std::vector<SurfaceStyle>>& canvas, Point start, Point end,
+              SurfaceStyle style)
+{
+    const int dx = end.x - start.x;
+    const int dy = end.y - start.y;
     const int steps = std::max(std::abs(dx), std::abs(dy));
-
-    if (steps == 0)
+    if (steps <= 0)
     {
-        if (x0 >= 0 && x0 < width && y0 >= 0 && y0 < height)
-        {
-            canvas[y0][x0].ch = ch;
-        }
+        SetPixel(canvas, start.x, start.y, style);
         return;
     }
 
     for (int step = 0; step <= steps; ++step)
     {
         const double ratio = static_cast<double>(step) / static_cast<double>(steps);
-        const int x = InterpolateInt(x0, x1, ratio);
-        const int y = InterpolateInt(y0, y1, ratio);
-        if (x >= 0 && x < width && y >= 0 && y < height)
+        const int x = static_cast<int>(std::lround(static_cast<double>(start.x) +
+                                                   static_cast<double>(dx) * ratio));
+        const int y = static_cast<int>(std::lround(static_cast<double>(start.y) +
+                                                   static_cast<double>(dy) * ratio));
+        SetPixel(canvas, x, y, style);
+    }
+}
+
+void FillPolygon(std::vector<std::vector<SurfaceStyle>>& canvas, const std::vector<Point>& points,
+                 SurfaceStyle style)
+{
+    const int height = static_cast<int>(canvas.size());
+    if (height <= 0 || points.size() < 3)
+    {
+        return;
+    }
+    const int width = static_cast<int>(canvas[0].size());
+
+    int min_y = points[0].y;
+    int max_y = points[0].y;
+    for (const Point& point : points)
+    {
+        min_y = std::min(min_y, point.y);
+        max_y = std::max(max_y, point.y);
+    }
+
+    min_y = std::max(min_y, 0);
+    max_y = std::min(max_y, height - 1);
+
+    for (int y = min_y; y <= max_y; ++y)
+    {
+        std::vector<double> intersections;
+        intersections.reserve(points.size());
+
+        for (std::size_t i = 0; i < points.size(); ++i)
         {
-            canvas[y][x].ch = ch;
+            const Point& a = points[i];
+            const Point& b = points[(i + 1) % points.size()];
+            if (a.y == b.y)
+            {
+                continue;
+            }
+
+            if ((a.y <= y && b.y > y) || (b.y <= y && a.y > y))
+            {
+                const double t = static_cast<double>(y - a.y) /
+                                 static_cast<double>(b.y - a.y);
+                intersections.push_back(static_cast<double>(a.x) +
+                                        static_cast<double>(b.x - a.x) * t);
+            }
+        }
+
+        if (intersections.size() < 2)
+        {
+            continue;
+        }
+
+        std::sort(intersections.begin(), intersections.end());
+        for (std::size_t i = 0; i + 1 < intersections.size(); i += 2)
+        {
+            int x_start = static_cast<int>(std::ceil(intersections[i]));
+            int x_end = static_cast<int>(std::floor(intersections[i + 1]));
+            x_start = std::max(x_start, 0);
+            x_end = std::min(x_end, width - 1);
+            for (int x = x_start; x <= x_end; ++x)
+            {
+                SetPixel(canvas, x, y, style);
+            }
         }
     }
 }
 
-std::string CorridorStateText(CorridorState state)
+void FillQuad(std::vector<std::vector<SurfaceStyle>>& canvas, const std::array<Point, 4>& quad,
+              SurfaceStyle style)
 {
-    if (!state.known)
+    FillPolygon(canvas, std::vector<Point>(quad.begin(), quad.end()), style);
+}
+
+Rect MakePerspectiveRect(int width, int height, int depth_index, int max_depth_index)
+{
+    const int scene_size = std::max(8, std::min(width, height) - 2);
+    const int half_base = std::max(4, scene_size / 2);
+
+    const double ratio =
+        static_cast<double>(depth_index) / static_cast<double>(std::max(1, max_depth_index));
+    const double curve = std::pow(ratio, 1.05);
+    const double min_scale = 0.18;
+    const double scale = 1.0 - (1.0 - min_scale) * curve;
+
+    const int half_size = std::max(3, static_cast<int>(std::lround(half_base * scale)));
+    const int center_x = width / 2;
+    const int center_y = height / 2;
+
+    Rect rect;
+    rect.left = std::clamp(center_x - half_size, 0, width - 1);
+    rect.right = std::clamp(center_x + half_size, rect.left + 2, width - 1);
+    rect.top = std::clamp(center_y - half_size, 0, height - 1);
+    rect.bottom = std::clamp(center_y + half_size, rect.top + 2, height - 1);
+    return rect;
+}
+
+CorridorFlag SideFlag(const mud::v1::FirstPersonCell* cell, bool left)
+{
+    if (cell == nullptr || !cell->visible())
     {
+        return CorridorFlag::kUnknown;
+    }
+    return left ? (cell->open_left() ? CorridorFlag::kOpen : CorridorFlag::kWall)
+                : (cell->open_right() ? CorridorFlag::kOpen : CorridorFlag::kWall);
+}
+
+std::string CorridorText(CorridorFlag flag)
+{
+    switch (flag)
+    {
+    case CorridorFlag::kOpen:
+        return "open";
+    case CorridorFlag::kWall:
+        return "wall";
+    case CorridorFlag::kUnknown:
+    default:
         return "unknown";
     }
-    return state.open ? "open" : "wall";
 }
+
+SurfaceStyle SideStyle(CorridorFlag flag, bool left)
+{
+    switch (flag)
+    {
+    case CorridorFlag::kOpen:
+        return left ? SurfaceStyle::kLeftOpen : SurfaceStyle::kRightOpen;
+    case CorridorFlag::kWall:
+        return left ? SurfaceStyle::kLeftWall : SurfaceStyle::kRightWall;
+    case CorridorFlag::kUnknown:
+    default:
+        return left ? SurfaceStyle::kLeftWall : SurfaceStyle::kRightWall;
+    }
+}
+
+void FillSidePanel(std::vector<std::vector<SurfaceStyle>>& canvas, const Rect& near_rect,
+                   const Rect& far_rect, bool left_side, CorridorFlag flag)
+{
+    const Point near_top = left_side ? Point{near_rect.left, near_rect.top}
+                                     : Point{near_rect.right, near_rect.top};
+    const Point near_bottom = left_side ? Point{near_rect.left, near_rect.bottom}
+                                        : Point{near_rect.right, near_rect.bottom};
+    const Point far_top = left_side ? Point{far_rect.left, far_rect.top}
+                                    : Point{far_rect.right, far_rect.top};
+    const Point far_bottom = left_side ? Point{far_rect.left, far_rect.bottom}
+                                       : Point{far_rect.right, far_rect.bottom};
+
+    if (flag != CorridorFlag::kOpen)
+    {
+        FillQuad(canvas,
+                 {{{near_top.x, near_top.y},
+                   {near_bottom.x, near_bottom.y},
+                   {far_bottom.x, far_bottom.y},
+                   {far_top.x, far_top.y}}},
+                 SideStyle(flag, left_side));
+        return;
+    }
+
+    const Point near_split_top = LerpPoint(near_top, near_bottom, 0.34);
+    const Point near_split_bottom = LerpPoint(near_top, near_bottom, 0.68);
+    const Point far_split_top = LerpPoint(far_top, far_bottom, 0.34);
+    const Point far_split_bottom = LerpPoint(far_top, far_bottom, 0.68);
+
+    FillQuad(canvas,
+             {{{near_top.x, near_top.y},
+               {near_split_top.x, near_split_top.y},
+               {far_split_top.x, far_split_top.y},
+               {far_top.x, far_top.y}}},
+             SurfaceStyle::kCeiling);
+
+    FillQuad(canvas,
+             {{{near_split_top.x, near_split_top.y},
+               {near_split_bottom.x, near_split_bottom.y},
+               {far_split_bottom.x, far_split_bottom.y},
+               {far_split_top.x, far_split_top.y}}},
+             left_side ? SurfaceStyle::kLeftOpen : SurfaceStyle::kRightOpen);
+
+    FillQuad(canvas,
+             {{{near_split_bottom.x, near_split_bottom.y},
+               {near_bottom.x, near_bottom.y},
+               {far_bottom.x, far_bottom.y},
+               {far_split_bottom.x, far_split_bottom.y}}},
+             SurfaceStyle::kFloor);
+}
+
+void DrawOpenSideGuides(std::vector<std::vector<SurfaceStyle>>& canvas, const Rect& near_rect,
+                        const Rect& far_rect, bool left_side)
+{
+    const Point near_top = left_side ? Point{near_rect.left, near_rect.top}
+                                     : Point{near_rect.right, near_rect.top};
+    const Point near_bottom = left_side ? Point{near_rect.left, near_rect.bottom}
+                                        : Point{near_rect.right, near_rect.bottom};
+    const Point far_top = left_side ? Point{far_rect.left, far_rect.top}
+                                    : Point{far_rect.right, far_rect.top};
+    const Point far_bottom = left_side ? Point{far_rect.left, far_rect.bottom}
+                                       : Point{far_rect.right, far_rect.bottom};
+
+    const Point near_band_top = LerpPoint(near_top, near_bottom, 0.34);
+    const Point near_band_bottom = LerpPoint(near_top, near_bottom, 0.68);
+    const Point far_band_top = LerpPoint(far_top, far_bottom, 0.34);
+    const Point far_band_bottom = LerpPoint(far_top, far_bottom, 0.68);
+
+    DrawLine(canvas, near_band_top, near_band_bottom, SurfaceStyle::kEdge);
+    DrawLine(canvas, far_band_top, far_band_bottom, SurfaceStyle::kEdge);
+    DrawLine(canvas, near_band_top, far_band_top, SurfaceStyle::kEdge);
+    DrawLine(canvas, near_band_bottom, far_band_bottom, SurfaceStyle::kEdge);
+
+    for (double t : {0.25, 0.5, 0.75})
+    {
+        const Point top = LerpPoint(near_band_top, far_band_top, t);
+        const Point bottom = LerpPoint(near_band_bottom, far_band_bottom, t);
+        DrawLine(canvas, top, bottom, SurfaceStyle::kEdge);
+    }
+}
+
+SurfaceStyle ActorStyle(mud::v1::VisibleActor::Kind actor_kind)
+{
+    switch (actor_kind)
+    {
+    case mud::v1::VisibleActor::KIND_SELF:
+        return SurfaceStyle::kActorSelf;
+    case mud::v1::VisibleActor::KIND_PLAYER:
+        return SurfaceStyle::kActorPlayer;
+    case mud::v1::VisibleActor::KIND_NPC:
+        return SurfaceStyle::kActorNpc;
+    case mud::v1::VisibleActor::KIND_UNSPECIFIED:
+    default:
+        return SurfaceStyle::kFrontUnknown;
+    }
+}
+
 } // namespace
 
 std::string FpsRenderer::Render(const mud::v1::FirstPersonView& view, int terminal_columns,
@@ -175,70 +387,167 @@ std::string FpsRenderer::Render(const mud::v1::FirstPersonView& view, int termin
         return (it == cells.end()) ? nullptr : it->second;
     };
 
-    CorridorState left_state;
-    CorridorState right_state;
-    CorridorState front_state;
+    const int max_depth = std::max(1, view.max_depth());
+    const int depth_layers = std::max(4, max_depth + 2);
 
-    bool front_unknown = false;
-    int front_depth_bucket = 2; // 0=near wall, 1=mid wall, 2=far/unknown, 3=open
+    const int char_width = std::clamp(terminal_columns - 2, 36, 140);
+    const int char_height = std::clamp(terminal_rows - 9, 8, 34);
+    const int pixel_width = char_width;
+    const int pixel_height = char_height * 2;
 
+    std::vector<std::vector<SurfaceStyle>> canvas(
+        static_cast<std::size_t>(pixel_height),
+        std::vector<SurfaceStyle>(static_cast<std::size_t>(pixel_width), SurfaceStyle::kVoid));
+
+    std::vector<Rect> rects;
+    rects.reserve(static_cast<std::size_t>(depth_layers + 1));
+    for (int depth_index = 0; depth_index <= depth_layers; ++depth_index)
+    {
+        rects.push_back(MakePerspectiveRect(pixel_width, pixel_height, depth_index, depth_layers));
+    }
+
+    CorridorFlag front_flag = CorridorFlag::kUnknown;
+    int wall_depth = -1;
     const auto* center = get_cell(0, 0);
     if (center != nullptr && center->visible())
     {
-        left_state.known = true;
-        left_state.open = center->open_left();
-
-        right_state.known = true;
-        right_state.open = center->open_right();
-
         if (!center->open_forward())
         {
-            front_state.known = true;
-            front_state.open = false;
-            front_depth_bucket = 0;
+            front_flag = CorridorFlag::kWall;
+            wall_depth = 0;
         }
         else
         {
-            const auto* depth1 = get_cell(1, 0);
-            if (depth1 == nullptr || !depth1->visible())
+            bool unresolved = false;
+            for (int depth = 1; depth <= max_depth; ++depth)
             {
-                front_state.known = false;
-                front_unknown = true;
-                front_depth_bucket = 2;
-            }
-            else if (!depth1->open_forward())
-            {
-                front_state.known = true;
-                front_state.open = false;
-                front_depth_bucket = 1;
-            }
-            else
-            {
-                const auto* depth2 = get_cell(2, 0);
-                if (depth2 != nullptr && depth2->visible() && !depth2->open_forward())
+                const auto* depth_cell = get_cell(depth, 0);
+                if (depth_cell == nullptr || !depth_cell->visible())
                 {
-                    front_state.known = true;
-                    front_state.open = false;
-                    front_depth_bucket = 2;
+                    unresolved = true;
+                    break;
                 }
-                else
+                if (!depth_cell->open_forward())
                 {
-                    front_state.known = true;
-                    front_state.open = true;
-                    front_depth_bucket = 3;
+                    front_flag = CorridorFlag::kWall;
+                    wall_depth = depth;
+                    unresolved = false;
+                    break;
                 }
+            }
+
+            if (wall_depth < 0)
+            {
+                front_flag = unresolved ? CorridorFlag::kUnknown : CorridorFlag::kOpen;
             }
         }
     }
-    else
+
+    int front_layer = depth_layers;
+    if (wall_depth >= 0)
     {
-        front_unknown = true;
-        front_depth_bucket = 2;
+        front_layer = std::min(depth_layers, wall_depth + 1);
+    }
+    else if (front_flag == CorridorFlag::kUnknown)
+    {
+        front_layer = std::min(depth_layers, max_depth + 1);
+    }
+    front_layer = std::max(front_layer, 1);
+
+    CorridorFlag left_flag = CorridorFlag::kUnknown;
+    CorridorFlag right_flag = CorridorFlag::kUnknown;
+    if (center != nullptr && center->visible())
+    {
+        left_flag = center->open_left() ? CorridorFlag::kOpen : CorridorFlag::kWall;
+        right_flag = center->open_right() ? CorridorFlag::kOpen : CorridorFlag::kWall;
+    }
+
+    for (int layer = 0; layer < front_layer; ++layer)
+    {
+        const Rect& near_rect = rects[static_cast<std::size_t>(layer)];
+        const Rect& far_rect = rects[static_cast<std::size_t>(layer + 1)];
+
+        const int sample_depth = std::min(layer, max_depth);
+        const auto* sample_cell = get_cell(sample_depth, 0);
+        const CorridorFlag layer_left_flag = SideFlag(sample_cell, true);
+        const CorridorFlag layer_right_flag = SideFlag(sample_cell, false);
+
+        FillSidePanel(canvas, near_rect, far_rect, true, layer_left_flag);
+        FillSidePanel(canvas, near_rect, far_rect, false, layer_right_flag);
+        if (layer_left_flag == CorridorFlag::kOpen)
+        {
+            DrawOpenSideGuides(canvas, near_rect, far_rect, true);
+        }
+        if (layer_right_flag == CorridorFlag::kOpen)
+        {
+            DrawOpenSideGuides(canvas, near_rect, far_rect, false);
+        }
+
+        FillQuad(canvas,
+                 {{{near_rect.left, near_rect.top},
+                   {near_rect.right, near_rect.top},
+                   {far_rect.right, far_rect.top},
+                   {far_rect.left, far_rect.top}}},
+                 SurfaceStyle::kCeiling);
+
+        FillQuad(canvas,
+                 {{{near_rect.left, near_rect.bottom},
+                   {near_rect.right, near_rect.bottom},
+                   {far_rect.right, far_rect.bottom},
+                   {far_rect.left, far_rect.bottom}}},
+                 SurfaceStyle::kFloor);
+
+    }
+
+    const Rect& front_rect = rects[static_cast<std::size_t>(front_layer)];
+    SurfaceStyle front_style = SurfaceStyle::kFrontUnknown;
+    if (front_flag == CorridorFlag::kWall)
+    {
+        front_style = SurfaceStyle::kFrontWall;
+    }
+    else if (front_flag == CorridorFlag::kOpen)
+    {
+        front_style = SurfaceStyle::kVoid;
+    }
+    FillQuad(canvas,
+             {{{front_rect.left, front_rect.top},
+               {front_rect.right, front_rect.top},
+               {front_rect.right, front_rect.bottom},
+               {front_rect.left, front_rect.bottom}}},
+             front_style);
+
+    const Rect& back_rect = rects.front();
+    DrawLine(canvas, {back_rect.left, back_rect.top}, {front_rect.left, front_rect.top},
+             SurfaceStyle::kEdge);
+    DrawLine(canvas, {back_rect.right, back_rect.top}, {front_rect.right, front_rect.top},
+             SurfaceStyle::kEdge);
+    DrawLine(canvas, {back_rect.left, back_rect.bottom}, {front_rect.left, front_rect.bottom},
+             SurfaceStyle::kEdge);
+    DrawLine(canvas, {back_rect.right, back_rect.bottom}, {front_rect.right, front_rect.bottom},
+             SurfaceStyle::kEdge);
+
+    DrawLine(canvas, {front_rect.left, front_rect.top}, {front_rect.right, front_rect.top},
+             SurfaceStyle::kEdge);
+    DrawLine(canvas, {front_rect.left, front_rect.bottom}, {front_rect.right, front_rect.bottom},
+             SurfaceStyle::kEdge);
+    DrawLine(canvas, {front_rect.left, front_rect.top}, {front_rect.left, front_rect.bottom},
+             SurfaceStyle::kEdge);
+    DrawLine(canvas, {front_rect.right, front_rect.top}, {front_rect.right, front_rect.bottom},
+             SurfaceStyle::kEdge);
+
+    for (int layer = 1; layer <= front_layer; ++layer)
+    {
+        const Rect& level = rects[static_cast<std::size_t>(layer)];
+        DrawLine(canvas, {level.left, level.top}, {level.right, level.top}, SurfaceStyle::kEdge);
+        DrawLine(canvas, {level.left, level.bottom}, {level.right, level.bottom},
+                 SurfaceStyle::kEdge);
+        DrawLine(canvas, {level.left, level.top}, {level.left, level.bottom}, SurfaceStyle::kEdge);
+        DrawLine(canvas, {level.right, level.top}, {level.right, level.bottom},
+                 SurfaceStyle::kEdge);
     }
 
     int nearest_actor_depth = std::numeric_limits<int>::max();
     mud::v1::VisibleActor::Kind nearest_actor_kind = mud::v1::VisibleActor::KIND_UNSPECIFIED;
-    mud::v1::Direction nearest_actor_facing = mud::v1::DIRECTION_UNSPECIFIED;
     for (const auto& cell : view.cells())
     {
         if (!cell.visible() || cell.lane() != 0 || cell.depth() <= 0)
@@ -253,213 +562,72 @@ std::string FpsRenderer::Render(const mud::v1::FirstPersonView& view, int termin
         {
             nearest_actor_depth = cell.depth();
             nearest_actor_kind = cell.actor_kind();
-            nearest_actor_facing = cell.actor_facing();
         }
     }
-
-    const int scene_width = std::clamp(terminal_columns - 2, 30, 120);
-    const int scene_height =
-        std::clamp((terminal_rows > 0 ? (terminal_rows / 2) : 14), 10, 22);
-
-    const int margin_x_pct[] = {16, 23, 30, 35};
-    const int margin_y_pct[] = {14, 20, 26, 31};
-    int margin_x = std::max(2, (scene_width * margin_x_pct[front_depth_bucket]) / 100);
-    int margin_y = std::max(1, (scene_height * margin_y_pct[front_depth_bucket]) / 100);
-
-    int front_left = margin_x;
-    int front_right = scene_width - 1 - margin_x;
-    int front_top = margin_y;
-    int front_bottom = scene_height - 1 - margin_y;
-
-    if ((front_right - front_left + 1) < 8)
-    {
-        const int center_x = scene_width / 2;
-        front_left = std::max(2, center_x - 4);
-        front_right = std::min(scene_width - 3, center_x + 3);
-    }
-    if ((front_bottom - front_top + 1) < 4)
-    {
-        const int center_y = scene_height / 2;
-        front_top = std::max(1, center_y - 2);
-        front_bottom = std::min(scene_height - 2, center_y + 1);
-    }
-
-    std::vector<std::vector<Pixel>> canvas(
-        static_cast<std::size_t>(scene_height),
-        std::vector<Pixel>(static_cast<std::size_t>(scene_width), Pixel{}));
-
-    const auto set_surface = [&](int x, int y, SurfaceStyle style)
-    {
-        if (x < 0 || x >= scene_width || y < 0 || y >= scene_height)
-        {
-            return;
-        }
-        canvas[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)].style = style;
-        canvas[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)].ch = ' ';
-    };
-
-    const auto set_char = [&](int x, int y, char ch)
-    {
-        if (x < 0 || x >= scene_width || y < 0 || y >= scene_height)
-        {
-            return;
-        }
-        canvas[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)].ch = ch;
-    };
-
-    const auto fill_span = [&](int y, int x0, int x1, SurfaceStyle style)
-    {
-        if (y < 0 || y >= scene_height)
-        {
-            return;
-        }
-        const int start = std::max(0, std::min(x0, x1));
-        const int end = std::min(scene_width - 1, std::max(x0, x1));
-        for (int x = start; x <= end; ++x)
-        {
-            set_surface(x, y, style);
-        }
-    };
-
-    auto left_inner_x = [&](int y) -> int
-    {
-        if (y < front_top)
-        {
-            const int denom = std::max(1, front_top);
-            const double ratio = static_cast<double>(y) / static_cast<double>(denom);
-            return InterpolateInt(0, front_left, ratio);
-        }
-        if (y <= front_bottom)
-        {
-            return front_left;
-        }
-        const int denom = std::max(1, (scene_height - 1) - front_bottom);
-        const double ratio = static_cast<double>(y - front_bottom) / static_cast<double>(denom);
-        return InterpolateInt(front_left, 0, ratio);
-    };
-
-    auto right_inner_x = [&](int y) -> int
-    {
-        if (y < front_top)
-        {
-            const int denom = std::max(1, front_top);
-            const double ratio = static_cast<double>(y) / static_cast<double>(denom);
-            return InterpolateInt(scene_width - 1, front_right, ratio);
-        }
-        if (y <= front_bottom)
-        {
-            return front_right;
-        }
-        const int denom = std::max(1, (scene_height - 1) - front_bottom);
-        const double ratio = static_cast<double>(y - front_bottom) / static_cast<double>(denom);
-        return InterpolateInt(front_right, scene_width - 1, ratio);
-    };
-
-    const SurfaceStyle left_surface =
-        left_state.known ? (left_state.open ? SurfaceStyle::kLeftOpen : SurfaceStyle::kLeftWall)
-                         : SurfaceStyle::kLeftWall;
-    const SurfaceStyle right_surface = right_state.known
-                                           ? (right_state.open ? SurfaceStyle::kRightOpen
-                                                               : SurfaceStyle::kRightWall)
-                                           : SurfaceStyle::kRightWall;
-
-    for (int y = 0; y < scene_height; ++y)
-    {
-        fill_span(y, 0, left_inner_x(y), left_surface);
-        fill_span(y, right_inner_x(y), scene_width - 1, right_surface);
-    }
-
-    for (int y = 0; y <= front_top; ++y)
-    {
-        const int denom = std::max(1, front_top);
-        const double ratio = static_cast<double>(y) / static_cast<double>(denom);
-        const int x0 = InterpolateInt(0, front_left, ratio);
-        const int x1 = InterpolateInt(scene_width - 1, front_right, ratio);
-        fill_span(y, x0, x1, SurfaceStyle::kCeiling);
-    }
-
-    for (int y = front_bottom; y < scene_height; ++y)
-    {
-        const int denom = std::max(1, (scene_height - 1) - front_bottom);
-        const double ratio = static_cast<double>(y - front_bottom) / static_cast<double>(denom);
-        const int x0 = InterpolateInt(front_left, 0, ratio);
-        const int x1 = InterpolateInt(front_right, scene_width - 1, ratio);
-        fill_span(y, x0, x1, SurfaceStyle::kFloor);
-    }
-
-    SurfaceStyle front_surface = SurfaceStyle::kFrontUnknown;
-    if (!front_unknown && front_state.known)
-    {
-        front_surface = front_state.open ? SurfaceStyle::kFrontOpen : SurfaceStyle::kFrontWall;
-    }
-    for (int y = front_top; y <= front_bottom; ++y)
-    {
-        fill_span(y, front_left, front_right, front_surface);
-    }
-
-    DrawLine(canvas, 0, 0, scene_width - 1, 0, '-');
-    DrawLine(canvas, 0, scene_height - 1, scene_width - 1, scene_height - 1, '-');
-    DrawLine(canvas, 0, 0, 0, scene_height - 1, '|');
-    DrawLine(canvas, scene_width - 1, 0, scene_width - 1, scene_height - 1, '|');
-    set_char(0, 0, '+');
-    set_char(scene_width - 1, 0, '+');
-    set_char(0, scene_height - 1, '+');
-    set_char(scene_width - 1, scene_height - 1, '+');
-
-    DrawLine(canvas, 0, 0, front_left, front_top, '/');
-    DrawLine(canvas, scene_width - 1, 0, front_right, front_top, '\\');
-    DrawLine(canvas, 0, scene_height - 1, front_left, front_bottom, '\\');
-    DrawLine(canvas, scene_width - 1, scene_height - 1, front_right, front_bottom, '/');
-
-    DrawLine(canvas, front_left, front_top, front_right, front_top, '-');
-    DrawLine(canvas, front_left, front_bottom, front_right, front_bottom, '-');
-    DrawLine(canvas, front_left, front_top, front_left, front_bottom, '|');
-    DrawLine(canvas, front_right, front_top, front_right, front_bottom, '|');
-    set_char(front_left, front_top, '+');
-    set_char(front_right, front_top, '+');
-    set_char(front_left, front_bottom, '+');
-    set_char(front_right, front_bottom, '+');
 
     if (nearest_actor_depth != std::numeric_limits<int>::max())
     {
-        const int max_depth = std::max(1, view.max_depth());
-        const int clamped_depth = std::clamp(nearest_actor_depth, 1, max_depth);
-        const double ratio = static_cast<double>(clamped_depth) /
-                             static_cast<double>(max_depth + 1);
-        const int actor_x = (front_left + front_right) / 2;
-        const int actor_y = front_top +
-                            std::max(1, static_cast<int>(
-                                            std::lround(static_cast<double>(front_bottom - front_top) *
-                                                        ratio)));
+        const int actor_layer = std::min(front_layer, nearest_actor_depth + 1);
+        const Rect& actor_rect = rects[static_cast<std::size_t>(actor_layer)];
+        const int center_x = (actor_rect.left + actor_rect.right) / 2;
+        const int center_y = (actor_rect.top + actor_rect.bottom) / 2;
+        const SurfaceStyle actor_style = ActorStyle(nearest_actor_kind);
+        const int actor_width = actor_rect.right - actor_rect.left + 1;
+        const int actor_height = actor_rect.bottom - actor_rect.top + 1;
 
-        set_char(actor_x, actor_y, ActorGlyph(nearest_actor_kind));
-        if (actor_x + 1 < front_right)
+        int half_w = std::clamp(actor_width / 10, 1, 6);
+        int half_h = std::clamp(actor_height / 8, 2, 8);
+        if (nearest_actor_kind == mud::v1::VisibleActor::KIND_NPC)
         {
-            set_char(actor_x + 1, actor_y, FacingGlyph(nearest_actor_facing));
+            half_w = std::max(half_w, 2);
+            half_h = std::max(half_h, 3);
+        }
+
+        for (int dy = -half_h; dy <= half_h; ++dy)
+        {
+            for (int dx = -half_w; dx <= half_w; ++dx)
+            {
+                SetPixel(canvas, center_x + dx, center_y + dy, actor_style);
+            }
         }
     }
 
     std::ostringstream out;
-    for (int y = 0; y < scene_height; ++y)
+    for (int y = 0; y < pixel_height; y += 2)
     {
-        SurfaceStyle active_style = SurfaceStyle::kVoid;
-        out << AnsiForStyle(active_style);
-        for (int x = 0; x < scene_width; ++x)
+        int active_fg = -1;
+        int active_bg = -1;
+
+        for (int x = 0; x < pixel_width; ++x)
         {
-            const Pixel& pixel = canvas[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)];
-            if (pixel.style != active_style)
+            const SurfaceStyle top_style =
+                canvas[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)];
+            const SurfaceStyle bottom_style =
+                canvas[static_cast<std::size_t>(std::min(y + 1, pixel_height - 1))]
+                      [static_cast<std::size_t>(x)];
+
+            const int top_color = StyleColor(top_style);
+            const int bottom_color = StyleColor(bottom_style);
+            const bool split = (top_color != bottom_color);
+
+            const int fg = split ? top_color : bottom_color;
+            const int bg = bottom_color;
+            if (fg != active_fg || bg != active_bg)
             {
-                active_style = pixel.style;
-                out << AnsiForStyle(active_style);
+                out << "\x1b[38;5;" << fg << "m\x1b[48;5;" << bg << "m";
+                active_fg = fg;
+                active_bg = bg;
             }
-            out << pixel.ch;
+
+            out << (split ? "\xE2\x96\x80" : " ");
         }
+
         out << "\x1b[0m\n";
     }
 
-    out << "Front: " << CorridorStateText(front_state) << "  Left: " << CorridorStateText(left_state)
-        << "  Right: " << CorridorStateText(right_state) << "\n";
-    out << "Legend: @^ you, P> player, N< npc, perspective lines=room edges\n";
+    out << "Front: " << CorridorText(front_flag) << "  Left: " << CorridorText(left_flag)
+        << "  Right: " << CorridorText(right_flag) << "\n";
+    out << "Open sides continue as ceiling/open-space/floor bands. Actor colors: yellow=self cyan=player red=npc\n";
     return out.str();
 }
 } // namespace grpcmud::client

@@ -76,7 +76,7 @@ private:
     const int view_front_squares_ = 3;
     const int view_back_squares_ = 1;
     const int view_side_squares_ = 2;
-    const int first_person_depth_squares_ = 2;
+    const int first_person_depth_squares_ = 4;
 
     std::chrono::seconds autosave_interval_;
     std::chrono::milliseconds tick_interval_;

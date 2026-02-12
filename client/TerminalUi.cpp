@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <sstream>
 #include <utility>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -17,8 +19,55 @@
 
 namespace grpcmud::client
 {
-TerminalUi::TerminalUi() : mode_(UiMode::kMove), max_log_lines_(14)
+namespace
 {
+std::vector<std::string> SplitLines(const std::string& text)
+{
+    std::vector<std::string> lines;
+    std::stringstream stream(text);
+    std::string line;
+    while (std::getline(stream, line))
+    {
+        lines.push_back(line);
+    }
+
+    if (!text.empty() && text.back() == '\n')
+    {
+        lines.push_back({});
+    }
+    return lines;
+}
+
+void BeginFrame(int columns, int rows)
+{
+#ifdef _WIN32
+    const HANDLE output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (output_handle != INVALID_HANDLE_VALUE)
+    {
+        CONSOLE_SCREEN_BUFFER_INFO info;
+        if (GetConsoleScreenBufferInfo(output_handle, &info))
+        {
+            const COORD home{0, 0};
+            DWORD written = 0;
+            const DWORD cells =
+                static_cast<DWORD>(std::max(1, columns) * std::max(1, rows));
+            FillConsoleOutputCharacterA(output_handle, ' ', cells, home, &written);
+            FillConsoleOutputAttribute(output_handle, info.wAttributes, cells, home, &written);
+            SetConsoleCursorPosition(output_handle, home);
+            return;
+        }
+    }
+#endif
+
+    std::cout << "\x1B[2J\x1B[H";
+}
+} // namespace
+
+TerminalUi::TerminalUi() : mode_(UiMode::kMove), max_log_lines_(64)
+{
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+#endif
 }
 
 void TerminalUi::SetMode(UiMode mode)
@@ -162,71 +211,70 @@ void TerminalUi::Render() const
     std::lock_guard<std::mutex> lock(mutex_);
     const TerminalSize terminal_size = DetectTerminalSize();
 
-    std::cout << "\x1B[2J\x1B[H";
-    std::cout << "grpcMUD Tactical Client" << '\n';
-    std::cout << "Mode: " << ModeName(mode_) << '\n';
-    std::cout << "Terminal: " << terminal_size.columns << "x" << terminal_size.rows << '\n';
+    std::vector<std::string> lines;
+    lines.reserve(static_cast<std::size_t>(terminal_size.rows));
+
+    const std::string view_label = render_map_debug_ ? "Map" : "FPS";
+    lines.push_back("grpcMUD | mode=" + std::string(ModeName(mode_)) + " | view=" + view_label +
+                    " | term=" + std::to_string(terminal_size.columns) + "x" +
+                    std::to_string(terminal_size.rows));
 
     if (death_screen_active_)
     {
-        std::cout << "==========================" << '\n';
-        std::cout << "      YOU ARE DOWN" << '\n';
-        std::cout << "Respawn in " << death_seconds_remaining_ << " second(s)." << '\n';
-        std::cout << "==========================" << '\n';
+        lines.push_back("==========================");
+        lines.push_back("      YOU ARE DOWN");
+        lines.push_back("Respawn in " + std::to_string(death_seconds_remaining_) + " second(s).");
+        lines.push_back("==========================");
     }
     else if (view_)
     {
-        std::cout << "Center: " << view_->center_square_id() << " (" << view_->center_x() << ","
-                  << view_->center_y() << ") "
-                  << "Facing: " << FacingLabel(view_->facing()) << '\n';
-        std::cout << "View: " << (render_map_debug_ ? "Map (debug)" : "FPS") << '\n';
+        lines.push_back("Center: " + view_->center_square_id() + " (" +
+                        std::to_string(view_->center_x()) + "," +
+                        std::to_string(view_->center_y()) + ") facing " +
+                        FacingLabel(view_->facing()));
+
         if (!render_map_debug_ && view_->has_first_person())
         {
-            std::cout << FpsRenderer::Render(view_->first_person(), terminal_size.columns,
-                                             terminal_size.rows);
+            const std::string frame =
+                FpsRenderer::Render(view_->first_person(), terminal_size.columns, terminal_size.rows);
+            const auto frame_lines = SplitLines(frame);
+            lines.insert(lines.end(), frame_lines.begin(), frame_lines.end());
         }
         else
         {
-            std::cout << "Legend: @^=you P>=player N<=npc .=floor ###=wall ???=fog walls=|---"
-                      << '\n';
-            std::cout << MapRenderer::Render(*view_);
+            const auto map_lines = SplitLines(MapRenderer::Render(*view_));
+            lines.insert(lines.end(), map_lines.begin(), map_lines.end());
         }
     }
     else
     {
-        std::cout << "Waiting for local view..." << '\n';
+        lines.push_back("Waiting for local view...");
     }
 
-    std::cout << '\n';
-    std::cout << "Logs:" << '\n';
-    for (const auto& line : logs_)
-    {
-        std::cout << "  " << line << '\n';
-    }
-
-    std::cout << '\n';
+    std::string controls_line;
     switch (mode_)
     {
     case UiMode::kMove:
         if (death_screen_active_)
         {
-            std::cout << "[Dead] Controls disabled while knocked out. Q:quit" << '\n';
+            controls_line = "[Dead] controls disabled. Q=quit";
         }
         else
         {
-            std::cout << "[Move] W/S:move A/D:turn 1:melee 2:ranged 3:guard V:view Enter:chat(/cmd) P:ping Q:quit"
-                      << '\n';
+            controls_line =
+                "[Move] W/S move A/D turn 1 melee 2 ranged 3 guard V view Enter chat P ping Q quit";
         }
         break;
     case UiMode::kCustomCommand:
         if (death_screen_active_)
         {
-            std::cout << "[Dead] Controls disabled while knocked out. Q:quit" << '\n';
+            controls_line = "[Dead] controls disabled. Q=quit";
         }
         else
         {
-            std::cout << "[Input] Enter to send. Chat by default, '/<cmd>' for commands ('/view map|fps'): "
-                      << input_buffer_ << '\n';
+            controls_line =
+                "[Input] Enter send, /view map|fps, /look, /move, /turn, /say, /guard, /attack, /ping: " +
+                input_buffer_;
         }
         break;
     case UiMode::kExplore:
@@ -234,14 +282,49 @@ void TerminalUi::Render() const
     case UiMode::kSay:
         if (death_screen_active_)
         {
-            std::cout << "[Dead] Controls disabled while knocked out. Q:quit" << '\n';
+            controls_line = "[Dead] controls disabled. Q=quit";
         }
         else
         {
-            std::cout << "[Move] W/S:move A/D:turn 1:melee 2:ranged 3:guard V:view Enter:chat(/cmd) P:ping Q:quit"
-                      << '\n';
+            controls_line =
+                "[Move] W/S move A/D turn 1 melee 2 ranged 3 guard V view Enter chat P ping Q quit";
         }
         break;
+    }
+
+    const int rows_for_logs =
+        std::max(0, terminal_size.rows - static_cast<int>(lines.size()) - 1);
+    if (rows_for_logs > 1)
+    {
+        lines.push_back("Logs:");
+        const int log_slots = rows_for_logs - 1;
+        const int log_count = std::min<int>(log_slots, static_cast<int>(logs_.size()));
+        const int start = static_cast<int>(logs_.size()) - log_count;
+        for (int index = start; index < static_cast<int>(logs_.size()); ++index)
+        {
+            lines.push_back("  " + logs_[static_cast<std::size_t>(index)]);
+        }
+    }
+
+    lines.push_back(controls_line);
+
+    if (static_cast<int>(lines.size()) > terminal_size.rows)
+    {
+        lines.resize(static_cast<std::size_t>(terminal_size.rows));
+    }
+
+    BeginFrame(terminal_size.columns, terminal_size.rows);
+    for (int row = 0; row < terminal_size.rows; ++row)
+    {
+        if (row < static_cast<int>(lines.size()))
+        {
+            std::cout << lines[static_cast<std::size_t>(row)];
+        }
+        std::cout << "\x1B[K";
+        if (row + 1 < terminal_size.rows)
+        {
+            std::cout << '\n';
+        }
     }
 
     std::cout.flush();

@@ -63,9 +63,7 @@ int ClientApp::Run(int argc, char** argv)
 
     ui_.SetMode(UiMode::kMove);
     ui_.AddLog("Connected to " + server_address_ + " as '" + player_name_ + "'.");
-    ui_.AddLog("Move mode: W/S=forward/backward, A/D=turn, 1=melee, 2=ranged, 3=guard.");
-    ui_.AddLog("FPS view enabled by default. V or '/view map' toggles debug map view.");
-    ui_.AddLog("Press Enter to chat. Prefix with '/' for commands.");
+    ui_.AddLog("FPS default. V toggles map/fps. Enter opens chat/commands.");
     ui_.Render();
 
     constexpr auto kRenderInterval = std::chrono::milliseconds(250);
@@ -263,11 +261,10 @@ void ClientApp::HandleServerMessage(const mud::v1::ServerMessage& message)
         ui_.AddLog("[motd] " + message.join_ack().motd());
         break;
     case mud::v1::ServerMessage::kCommandAck:
-        ui_.AddLog("[ack] " + message.command_ack().request_id() + " accepted=" +
-                   (message.command_ack().accepted() ? "true" : "false") + " \"" +
-                   message.command_ack().message() + "\"");
         if (!message.command_ack().accepted())
         {
+            ui_.AddLog("[ack] " + message.command_ack().request_id() + " rejected \"" +
+                       message.command_ack().message() + "\"");
             const int respawn_seconds =
                 maybe_respawn_seconds_from_text(message.command_ack().message());
             if (respawn_seconds >= 0)
