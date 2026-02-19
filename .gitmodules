@@ -1,3 +1,7 @@
 [submodule "external/vcpkg"]
 	path = external/vcpkg
 	url = https://github.com/microsoft/vcpkg
+[submodule "external/frame"]
+	path = external/frame
+	url = https://github.com/anirul/frame.git
+	branch = master
