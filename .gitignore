@@ -42,7 +42,9 @@
 
 build/**
 doc/
-data/*.pb
+# Keep canonical map source, ignore generated/binary data artifacts.
+data/*
+!data/world_state.json
 asset/cache/
 asset/model/
 imgui.ini
