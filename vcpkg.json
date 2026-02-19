@@ -3,7 +3,25 @@
   "version-string": "0.1.0",
   "dependencies": [
     "abseil",
+    "glad",
+    "glm",
     "grpc",
-    "protobuf"
+    "gtest",
+    "happly",
+    {
+      "name": "imgui",
+      "features": [ "opengl3-binding", "sdl3-binding", "docking-experimental" ]
+    },
+    "opengl",
+    "protobuf",
+    {
+      "name": "sdl3",
+      "features": [ "vulkan" ]
+    },
+    "shaderc",
+    "spdlog",
+    "stb",
+    "tinyobjloader",
+    "vulkan"
   ]
 }
