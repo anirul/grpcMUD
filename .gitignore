@@ -43,3 +43,7 @@
 build/**
 doc/
 data/*.pb
+asset/cache/
+asset/model/
+imgui.ini
+log.txt
