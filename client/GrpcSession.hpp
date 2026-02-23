@@ -34,7 +34,7 @@ private:
     std::unique_ptr<mud::v1::MudService::Stub> stub_;
     std::unique_ptr<grpc::ClientReaderWriter<mud::v1::ClientMessage, mud::v1::ServerMessage>>
         stream_;
-    grpc::ClientContext context_;
+    std::unique_ptr<grpc::ClientContext> context_;
 
     std::thread reader_thread_;
     std::atomic<bool> open_;

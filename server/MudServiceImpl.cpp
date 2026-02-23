@@ -119,7 +119,7 @@ grpc::Status MudServiceImpl::Play(
     auto session = std::make_shared<ClientSession>(stream);
     std::atomic<bool> done{false};
     bool joined = false;
-    std::uint64_t last_move_or_turn_tick = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t last_gameplay_command_tick = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t next_ranged_attack_ready_tick = 0;
     PlayerSnapshot player;
 
@@ -234,6 +234,21 @@ grpc::Status MudServiceImpl::Play(
             }
             return true;
         };
+        const auto reserve_tick_for_gameplay_command = [&](const std::string& request_id) -> bool
+        {
+            if (current_tick == last_gameplay_command_tick)
+            {
+                if (!SendAck(session, current_tick, request_id, false,
+                             "Only one command is allowed per tick."))
+                {
+                    done.store(true, std::memory_order_relaxed);
+                }
+                return false;
+            }
+
+            last_gameplay_command_tick = current_tick;
+            return true;
+        };
 
         switch (in.payload_case())
         {
@@ -268,7 +283,8 @@ grpc::Status MudServiceImpl::Play(
             auto* ack = join_ack.mutable_join_ack();
             ack->set_player_id(player.player_id);
             ack->set_motd("Welcome to Quest Board PvP. Actions: look, step(move/turn), "
-                          "guard, say <text>, attack <melee|ranged>, ping.");
+                          "guard, say <text>, attack <melee|ranged>, ping. "
+                          "Only one gameplay command per tick is allowed.");
             if (!session->Write(std::move(join_ack)))
             {
                 done.store(true, std::memory_order_relaxed);
@@ -305,6 +321,10 @@ grpc::Status MudServiceImpl::Play(
             {
                 break;
             }
+            if (!reserve_tick_for_gameplay_command(request_id))
+            {
+                break;
+            }
 
             if (!SendAck(session, current_tick, request_id, true, "ok"))
             {
@@ -337,21 +357,14 @@ grpc::Status MudServiceImpl::Play(
             {
                 break;
             }
-
-            if (current_tick == last_move_or_turn_tick)
+            if (!reserve_tick_for_gameplay_command(request_id))
             {
-                if (!SendAck(session, current_tick, request_id, false,
-                             "Only one move/turn command is allowed per tick."))
-                {
-                    done.store(true, std::memory_order_relaxed);
-                }
                 break;
             }
 
             if (step.kind() == mud::v1::STEP_KIND_MOVE_FORWARD ||
                 step.kind() == mud::v1::STEP_KIND_MOVE_BACKWARD)
             {
-                last_move_or_turn_tick = current_tick;
                 const std::string move_arg =
                     (step.kind() == mud::v1::STEP_KIND_MOVE_FORWARD) ? "forward" : "backward";
                 const MoveResult move = world_.MovePlayer(player.player_id, move_arg);
@@ -388,7 +401,6 @@ grpc::Status MudServiceImpl::Play(
             if (step.kind() == mud::v1::STEP_KIND_TURN_LEFT ||
                 step.kind() == mud::v1::STEP_KIND_TURN_RIGHT)
             {
-                last_move_or_turn_tick = current_tick;
                 const std::string turn_arg =
                     (step.kind() == mud::v1::STEP_KIND_TURN_LEFT) ? "left" : "right";
                 const TurnResult turn = world_.TurnPlayer(player.player_id, turn_arg);
@@ -439,6 +451,10 @@ grpc::Status MudServiceImpl::Play(
             {
                 break;
             }
+            if (!reserve_tick_for_gameplay_command(request_id))
+            {
+                break;
+            }
 
             const std::string text = Trim(say.text());
             if (text.empty())
@@ -469,6 +485,10 @@ grpc::Status MudServiceImpl::Play(
             const std::string request_id =
                 guard_req.request_id().empty() ? "missing-request-id" : guard_req.request_id();
             if (!prepare_action(request_id))
+            {
+                break;
+            }
+            if (!reserve_tick_for_gameplay_command(request_id))
             {
                 break;
             }
@@ -512,6 +532,10 @@ grpc::Status MudServiceImpl::Play(
             const std::string request_id =
                 attack_req.request_id().empty() ? "missing-request-id" : attack_req.request_id();
             if (!prepare_action(request_id))
+            {
+                break;
+            }
+            if (!reserve_tick_for_gameplay_command(request_id))
             {
                 break;
             }

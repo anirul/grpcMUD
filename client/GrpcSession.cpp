@@ -16,9 +16,22 @@ GrpcSession::~GrpcSession()
 bool GrpcSession::Connect(const std::string& server_address, const std::string& player_name,
                           std::string* error_message)
 {
+    const grpc::Status previous_status = Shutdown();
+    if (!previous_status.ok())
+    {
+        if (error_message)
+        {
+            *error_message =
+                "Previous stream shutdown failed: [" + std::to_string(previous_status.error_code()) +
+                "] " + previous_status.error_message();
+        }
+        return false;
+    }
+
     auto channel = grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
     stub_ = mud::v1::MudService::NewStub(channel);
-    stream_ = stub_->Play(&context_);
+    context_ = std::make_unique<grpc::ClientContext>();
+    stream_ = stub_->Play(context_.get());
 
     if (!stream_)
     {
@@ -38,6 +51,7 @@ bool GrpcSession::Connect(const std::string& server_address, const std::string& 
             *error_message = "Server closed stream before JoinRequest was sent.";
         }
         stream_.reset();
+        context_.reset();
         return false;
     }
 
@@ -82,15 +96,22 @@ grpc::Status GrpcSession::Shutdown()
 {
     {
         std::lock_guard<std::mutex> lock(write_mutex_);
-        if (stream_)
+        if (context_)
         {
-            stream_->WritesDone();
+            context_->TryCancel();
         }
     }
 
     if (reader_thread_.joinable())
     {
-        reader_thread_.join();
+        if (reader_thread_.get_id() == std::this_thread::get_id())
+        {
+            reader_thread_.detach();
+        }
+        else
+        {
+            reader_thread_.join();
+        }
     }
 
     grpc::Status status = grpc::Status::OK;
@@ -101,6 +122,7 @@ grpc::Status GrpcSession::Shutdown()
             status = stream_->Finish();
             stream_.reset();
         }
+        context_.reset();
     }
 
     open_.store(false, std::memory_order_relaxed);

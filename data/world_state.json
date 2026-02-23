@@ -836,20 +836,13 @@
    "hp": 4
   },
   {
-   "npc_id": "npc-2",
-   "name": "bandit archer",
-   "square_id": "sq-9-1",
-   "facing": "DIRECTION_SOUTH",
-   "hp": 4
-  },
-  {
    "npc_id": "npc-3",
    "name": "rust sentinel",
    "square_id": "sq-5-5",
-   "facing": "DIRECTION_SOUTH",
+   "facing": "DIRECTION_EAST",
    "hp": 4
   }
  ],
- "next_player_id": "15",
+ "next_player_id": "2",
  "next_npc_id": "4"
 }
