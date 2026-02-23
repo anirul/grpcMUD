@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -19,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -31,12 +34,17 @@
 #include "frame/gui/draw_gui_factory.h"
 #include "frame/gui/gui_window_interface.h"
 #include "frame/json/parse_level.h"
+#include "frame/logger.h"
+#include "frame/vulkan/device.h"
+#include "frame/vulkan/window_factory.h"
 #include "frame/window_factory.h"
 #include "frame/window_interface.h"
 
 ABSL_FLAG(std::string, server_address, "localhost:50051", "gRPC server address.");
 ABSL_FLAG(std::string, player_name, "",
           "Player name to join as. If empty, the client prompts interactively.");
+ABSL_FLAG(std::string, render_api, "opengl",
+          "Rendering backend for the client (opengl|vulkan).");
 
 namespace grpcmud::client
 {
@@ -47,6 +55,7 @@ constexpr glm::uvec2 kDefaultWindowSize{1280u, 720u};
 constexpr float kCellSize = 2.0f;
 constexpr float kHalfCell = kCellSize * 0.5f;
 constexpr float kFloorThickness = 0.10f;
+constexpr float kFloorTileSize = kCellSize + 0.02f;
 constexpr float kFloorCenterY = -0.62f;
 constexpr float kGroundY = kFloorCenterY + (kFloorThickness * 0.5f);
 constexpr float kBaseFloorThickness = 0.08f;
@@ -63,10 +72,23 @@ constexpr float kNpcWidth = 0.65f;
 constexpr float kCameraHeight = 0.92f;
 constexpr float kCameraForwardDistance = 2.0f;
 constexpr float kCameraNearClip = 0.12f;
+constexpr float kPi = 3.14159265358979323846f;
+constexpr std::uint64_t kMinTickIntervalEstimateMs = 100;
+constexpr std::uint64_t kMaxTickIntervalEstimateMs = 1500;
 
 std::int64_t CoordKey(int x, int y)
 {
     return (static_cast<std::int64_t>(x) << 32) ^ static_cast<std::uint32_t>(y);
+}
+
+int CoordXFromKey(std::int64_t key)
+{
+    return static_cast<std::int32_t>(key >> 32);
+}
+
+int CoordYFromKey(std::int64_t key)
+{
+    return static_cast<std::int32_t>(key & 0xFFFFFFFF);
 }
 
 struct FacingVec
@@ -93,6 +115,171 @@ FacingVec ToFacingVec(mud::v1::Direction direction)
     }
 }
 
+mud::v1::Direction TurnLeftDirection(mud::v1::Direction direction)
+{
+    switch (direction)
+    {
+    case mud::v1::DIRECTION_NORTH:
+        return mud::v1::DIRECTION_WEST;
+    case mud::v1::DIRECTION_WEST:
+        return mud::v1::DIRECTION_SOUTH;
+    case mud::v1::DIRECTION_SOUTH:
+        return mud::v1::DIRECTION_EAST;
+    case mud::v1::DIRECTION_EAST:
+        return mud::v1::DIRECTION_NORTH;
+    case mud::v1::DIRECTION_UNSPECIFIED:
+    default:
+        return mud::v1::DIRECTION_NORTH;
+    }
+}
+
+mud::v1::Direction TurnRightDirection(mud::v1::Direction direction)
+{
+    switch (direction)
+    {
+    case mud::v1::DIRECTION_NORTH:
+        return mud::v1::DIRECTION_EAST;
+    case mud::v1::DIRECTION_EAST:
+        return mud::v1::DIRECTION_SOUTH;
+    case mud::v1::DIRECTION_SOUTH:
+        return mud::v1::DIRECTION_WEST;
+    case mud::v1::DIRECTION_WEST:
+        return mud::v1::DIRECTION_NORTH;
+    case mud::v1::DIRECTION_UNSPECIFIED:
+    default:
+        return mud::v1::DIRECTION_NORTH;
+    }
+}
+
+std::pair<int, int> DirectionToGridDelta(mud::v1::Direction direction)
+{
+    switch (direction)
+    {
+    case mud::v1::DIRECTION_NORTH:
+        return {0, -1};
+    case mud::v1::DIRECTION_EAST:
+        return {1, 0};
+    case mud::v1::DIRECTION_SOUTH:
+        return {0, 1};
+    case mud::v1::DIRECTION_WEST:
+        return {-1, 0};
+    case mud::v1::DIRECTION_UNSPECIFIED:
+    default:
+        return {0, -1};
+    }
+}
+
+const mud::v1::VisibleSquare* FindCenterSquare(const mud::v1::LocalViewUpdate& view)
+{
+    for (const auto& square : view.squares())
+    {
+        if (square.x() == view.center_x() && square.y() == view.center_y())
+        {
+            return &square;
+        }
+    }
+    return nullptr;
+}
+
+bool CanPredictMoveFromCenter(const mud::v1::LocalViewUpdate& view, mud::v1::StepKind kind)
+{
+    const mud::v1::VisibleSquare* center = FindCenterSquare(view);
+    if (!center)
+    {
+        return true;
+    }
+
+    mud::v1::Direction movement_direction = view.facing();
+    if (kind == mud::v1::STEP_KIND_MOVE_BACKWARD)
+    {
+        movement_direction = TurnLeftDirection(TurnLeftDirection(movement_direction));
+    }
+
+    auto is_cell_occupied_by_actor = [&](int x, int y) {
+        for (const auto& actor : view.actors())
+        {
+            if (actor.kind() == mud::v1::VisibleActor::KIND_SELF)
+            {
+                continue;
+            }
+            if (actor.x() == x && actor.y() == y)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    const auto [dx, dy] = DirectionToGridDelta(movement_direction);
+    const int target_x = view.center_x() + dx;
+    const int target_y = view.center_y() + dy;
+
+    switch (movement_direction)
+    {
+    case mud::v1::DIRECTION_NORTH:
+        return center->open_north() && !is_cell_occupied_by_actor(target_x, target_y);
+    case mud::v1::DIRECTION_EAST:
+        return center->open_east() && !is_cell_occupied_by_actor(target_x, target_y);
+    case mud::v1::DIRECTION_SOUTH:
+        return center->open_south() && !is_cell_occupied_by_actor(target_x, target_y);
+    case mud::v1::DIRECTION_WEST:
+        return center->open_west() && !is_cell_occupied_by_actor(target_x, target_y);
+    case mud::v1::DIRECTION_UNSPECIFIED:
+    default:
+        return true;
+    }
+}
+
+float DirectionToYawRadians(mud::v1::Direction direction)
+{
+    const FacingVec facing = ToFacingVec(direction);
+    return std::atan2(facing.z, facing.x);
+}
+
+float NormalizeAngleRadians(float radians)
+{
+    const float two_pi = 2.0f * kPi;
+    float wrapped = std::fmod(radians + kPi, two_pi);
+    if (wrapped < 0.0f)
+    {
+        wrapped += two_pi;
+    }
+    return wrapped - kPi;
+}
+
+float LerpAngleRadians(float from, float to, float t)
+{
+    return from + (NormalizeAngleRadians(to - from) * t);
+}
+
+float SmoothStep(float t)
+{
+    t = std::clamp(t, 0.0f, 1.0f);
+    return t * t * (3.0f - (2.0f * t));
+}
+
+bool IsSingleTickMoveOrTurn(const mud::v1::LocalViewUpdate& from,
+                            const mud::v1::LocalViewUpdate& to)
+{
+    const int dx = to.center_x() - from.center_x();
+    const int dy = to.center_y() - from.center_y();
+    const int manhattan = std::abs(dx) + std::abs(dy);
+    if (manhattan == 1)
+    {
+        return true;
+    }
+
+    if (manhattan != 0)
+    {
+        return false;
+    }
+
+    const float from_yaw = DirectionToYawRadians(from.facing());
+    const float to_yaw = DirectionToYawRadians(to.facing());
+    const float yaw_delta = std::abs(NormalizeAngleRadians(to_yaw - from_yaw));
+    return yaw_delta > 0.01f && yaw_delta <= (kPi * 0.75f);
+}
+
 struct CubeSpec
 {
     float tx = 0.0f;
@@ -109,6 +296,42 @@ void AddCubeSpec(std::vector<CubeSpec>& cubes, float tx, float ty, float tz, flo
     cubes.push_back(CubeSpec{tx, ty, tz, sx, sy, sz});
 }
 
+std::uint64_t Fnv1aAppend(std::uint64_t hash, std::uint64_t value)
+{
+    constexpr std::uint64_t kFnvPrime = 1099511628211ull;
+    for (int i = 0; i < 8; ++i)
+    {
+        const std::uint8_t byte = static_cast<std::uint8_t>((value >> (i * 8)) & 0xFFu);
+        hash ^= byte;
+        hash *= kFnvPrime;
+    }
+    return hash;
+}
+
+std::uint32_t FloatBits(float value)
+{
+    std::uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+std::uint64_t HashCubeSpecs(const std::vector<CubeSpec>& cubes)
+{
+    std::uint64_t hash = 1469598103934665603ull;
+    hash = Fnv1aAppend(hash, static_cast<std::uint64_t>(cubes.size()));
+    for (const CubeSpec& cube : cubes)
+    {
+        hash = Fnv1aAppend(hash, FloatBits(cube.tx));
+        hash = Fnv1aAppend(hash, FloatBits(cube.ty));
+        hash = Fnv1aAppend(hash, FloatBits(cube.tz));
+        hash = Fnv1aAppend(hash, FloatBits(cube.sx));
+        hash = Fnv1aAppend(hash, FloatBits(cube.sy));
+        hash = Fnv1aAppend(hash, FloatBits(cube.sz));
+    }
+    return hash;
+}
+
 void WriteRaytraceObj(const std::filesystem::path& path, const std::vector<CubeSpec>& cubes)
 {
     std::vector<CubeSpec> final_cubes = cubes;
@@ -117,15 +340,10 @@ void WriteRaytraceObj(const std::filesystem::path& path, const std::vector<CubeS
         final_cubes.push_back(CubeSpec{100000.0f, -100000.0f, 100000.0f, 0.01f, 0.01f, 0.01f});
     }
 
-    std::ofstream out(path, std::ios::trunc);
-    if (!out.is_open())
-    {
-        throw std::runtime_error("Failed to write OBJ file: " + path.string());
-    }
-
-    out << "# generated by grpcMUD client\n";
-    out << "o mesh\n";
-    out << std::fixed << std::setprecision(5);
+    std::ostringstream generated;
+    generated << "# generated by grpcMUD client\n";
+    generated << "o mesh\n";
+    generated << std::fixed << std::setprecision(5);
 
     int next_index = 1;
     const auto emit_quad = [&](const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
@@ -139,16 +357,16 @@ void WriteRaytraceObj(const std::filesystem::path& path, const std::vector<CubeS
                                            {0.0f, 1.0f}}};
         for (std::size_t i = 0; i < points.size(); ++i)
         {
-            out << "v " << points[i].x << ' ' << points[i].y << ' ' << points[i].z << '\n';
-            out << "vt " << uv[i].x << ' ' << uv[i].y << '\n';
-            out << "vn " << normal.x << ' ' << normal.y << ' ' << normal.z << '\n';
+            generated << "v " << points[i].x << ' ' << points[i].y << ' ' << points[i].z << '\n';
+            generated << "vt " << uv[i].x << ' ' << uv[i].y << '\n';
+            generated << "vn " << normal.x << ' ' << normal.y << ' ' << normal.z << '\n';
         }
-        out << "f " << base << '/' << base << '/' << base << ' ' << (base + 1) << '/'
-            << (base + 1) << '/' << (base + 1) << ' ' << (base + 2) << '/' << (base + 2) << '/'
-            << (base + 2) << '\n';
-        out << "f " << base << '/' << base << '/' << base << ' ' << (base + 2) << '/'
-            << (base + 2) << '/' << (base + 2) << ' ' << (base + 3) << '/' << (base + 3) << '/'
-            << (base + 3) << '\n';
+        generated << "f " << base << '/' << base << '/' << base << ' ' << (base + 1) << '/'
+                  << (base + 1) << '/' << (base + 1) << ' ' << (base + 2) << '/'
+                  << (base + 2) << '/' << (base + 2) << '\n';
+        generated << "f " << base << '/' << base << '/' << base << ' ' << (base + 2) << '/'
+                  << (base + 2) << '/' << (base + 2) << ' ' << (base + 3) << '/'
+                  << (base + 3) << '/' << (base + 3) << '\n';
         next_index += 4;
     };
 
@@ -179,6 +397,32 @@ void WriteRaytraceObj(const std::filesystem::path& path, const std::vector<CubeS
         emit_quad(glm::vec3(min_x, max_y, min_z), glm::vec3(max_x, max_y, min_z),
                   glm::vec3(max_x, max_y, max_z), glm::vec3(min_x, max_y, max_z),
                   glm::vec3(0.0f, 1.0f, 0.0f));
+    }
+
+    const std::string generated_obj = generated.str();
+    {
+        std::ifstream current(path, std::ios::binary);
+        if (current.is_open())
+        {
+            std::ostringstream existing;
+            existing << current.rdbuf();
+            if (existing.str() == generated_obj)
+            {
+                return;
+            }
+        }
+    }
+
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out.is_open())
+    {
+        throw std::runtime_error("Failed to write OBJ file: " + path.string());
+    }
+    out << generated_obj;
+    out.flush();
+    if (!out.good())
+    {
+        throw std::runtime_error("Failed to flush OBJ file: " + path.string());
     }
 }
 
@@ -225,6 +469,10 @@ int ClientApp::Run(int argc, char** argv)
         return 1;
     }
 
+    // Keep frame internals quiet by default; warn/error is still visible.
+    frame::Logger::GetInstance()->set_level(spdlog::level::warn);
+    frame::Logger::GetInstance()->flush_on(spdlog::level::warn);
+
     server_address_ = Trim(absl::GetFlag(FLAGS_server_address));
     if (server_address_.empty())
     {
@@ -241,31 +489,39 @@ int ClientApp::Run(int argc, char** argv)
     {
         player_name_ = Trim(positional_args[2]);
     }
-    if (player_name_.empty())
-    {
-        player_name_ = ReadPlayerNameFromPrompt();
-    }
 
-    std::string error_message;
-    if (!session_.Connect(server_address_, player_name_, &error_message))
+    const std::string requested_backend = ToLower(Trim(absl::GetFlag(FLAGS_render_api)));
+    frame::RenderingAPIEnum rendering_api = frame::RenderingAPIEnum::OPENGL;
+    if (requested_backend.empty() || requested_backend == "opengl")
     {
-        std::cerr << error_message << std::endl;
+        rendering_api = frame::RenderingAPIEnum::OPENGL;
+    }
+    else if (requested_backend == "vulkan")
+    {
+        rendering_api = frame::RenderingAPIEnum::VULKAN;
+    }
+    else
+    {
+        std::cerr << "Unsupported --render_api value '" << requested_backend
+                  << "'. Expected 'opengl' or 'vulkan'." << std::endl;
         return 1;
     }
 
-    session_.StartReader(
-        [this](const mud::v1::ServerMessage& message) { QueueServerMessage(message); },
-        [this]() { HandleServerClosed(); });
+    if (rendering_api == frame::RenderingAPIEnum::VULKAN)
+    {
+        frame::vulkan::EnsureWindowFactoryRegistered();
+    }
 
-    AddLog("Connected to " + server_address_ + " as '" + player_name_ + "'.");
-    AddLog("3D mode. WASD move/turn, 1/2 attack, 3 guard, Enter chat, Q quit.");
-    SendLookRequest();
+    std::snprintf(server_address_input_buffer_.data(), server_address_input_buffer_.size(), "%s",
+                  server_address_.c_str());
+    std::snprintf(player_name_input_buffer_.data(), player_name_input_buffer_.size(), "%s",
+                  player_name_.c_str());
 
     std::unique_ptr<frame::WindowInterface> window;
     try
     {
         window = frame::CreateNewWindow(frame::DrawingTargetEnum::WINDOW,
-                                        frame::RenderingAPIEnum::OPENGL, kDefaultWindowSize);
+                                        rendering_api, kDefaultWindowSize);
     }
     catch (const std::exception& ex)
     {
@@ -277,6 +533,10 @@ int ClientApp::Run(int argc, char** argv)
         std::cerr << "Failed to create 3D window." << std::endl;
         return 1;
     }
+
+    AddLog("Enter server + player name in HUD and press Connect.");
+    AddLog(std::string("Renderer: ") +
+           (rendering_api == frame::RenderingAPIEnum::VULKAN ? "vulkan" : "opengl"));
 
     RegisterKeyBindings(*window);
 
@@ -320,7 +580,7 @@ int ClientApp::Run(int argc, char** argv)
     }
 
     const grpc::Status status = session_.Shutdown();
-    if (!status.ok())
+    if (!status.ok() && connected_)
     {
         std::cerr << "RPC ended with error: [" << status.error_code() << "] "
                   << status.error_message() << std::endl;
@@ -346,25 +606,6 @@ std::string ClientApp::ToLower(std::string text)
     std::transform(text.begin(), text.end(), text.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return text;
-}
-
-std::string ClientApp::ReadPlayerNameFromPrompt()
-{
-    std::string name;
-    while (name.empty())
-    {
-        std::cout << "Enter player name: ";
-        if (!std::getline(std::cin, name))
-        {
-            return {};
-        }
-        name = Trim(name);
-        if (name.empty())
-        {
-            std::cout << "Player name cannot be empty." << '\n';
-        }
-    }
-    return name;
 }
 
 std::string ClientApp::JsonEscape(const std::string& text)
@@ -398,6 +639,63 @@ std::string ClientApp::JsonEscape(const std::string& text)
     return escaped;
 }
 
+bool ClientApp::TryConnect()
+{
+    if (connected_)
+    {
+        return true;
+    }
+
+    const std::string desired_server = Trim(server_address_input_buffer_.data());
+    const std::string desired_player_name = Trim(player_name_input_buffer_.data());
+
+    if (desired_server.empty())
+    {
+        connect_error_message_ = "Server address cannot be empty.";
+        AddLog("[connect] " + connect_error_message_);
+        return false;
+    }
+    if (desired_player_name.empty())
+    {
+        connect_error_message_ = "Player name cannot be empty.";
+        AddLog("[connect] " + connect_error_message_);
+        return false;
+    }
+
+    std::string error_message;
+    if (!session_.Connect(desired_server, desired_player_name, &error_message))
+    {
+        connect_error_message_ =
+            error_message.empty() ? "Failed to open stream." : error_message;
+        AddLog("[connect] " + connect_error_message_);
+        return false;
+    }
+
+    server_address_ = desired_server;
+    player_name_ = desired_player_name;
+    connected_ = true;
+    connect_error_message_.clear();
+    server_closed_.store(false, std::memory_order_relaxed);
+    server_closed_logged_ = false;
+
+    session_.StartReader(
+        [this](const mud::v1::ServerMessage& message) { QueueServerMessage(message); },
+        [this]() { HandleServerClosed(); });
+
+    AddLog("Connected to " + server_address_ + " as '" + player_name_ + "'.");
+    AddLog("3D mode. WASD move/turn, 1/2 attack, 3 guard, Enter chat, Q quit.");
+    {
+        mud::v1::ClientMessage look_message;
+        look_message.mutable_look()->set_request_id(NextRequestId());
+        if (!SendMessage(std::move(look_message)))
+        {
+            AddLog("[warn] Failed to request initial look.");
+        }
+    }
+    RequestInputFocus();
+    return true;
+}
+
 std::string ClientApp::NextRequestId()
 {
     return "req-" + std::to_string(request_counter_++);
@@ -405,6 +703,12 @@ std::string ClientApp::NextRequestId()
 
 bool ClientApp::SendMessage(mud::v1::ClientMessage message)
 {
+    if (!connected_ || server_closed_.load(std::memory_order_relaxed))
+    {
+        AddLog("[connect] Not connected.");
+        return false;
+    }
+
     if (!session_.SendClientMessage(message))
     {
         AddLog("[error] Failed to send command.");
@@ -418,7 +722,7 @@ bool ClientApp::SendLookRequest()
 {
     mud::v1::ClientMessage message;
     message.mutable_look()->set_request_id(NextRequestId());
-    return SendMessage(std::move(message));
+    return TrySendGameplayCommand(std::move(message));
 }
 
 bool ClientApp::SendStepRequest(mud::v1::StepKind kind)
@@ -427,7 +731,12 @@ bool ClientApp::SendStepRequest(mud::v1::StepKind kind)
     auto* step = message.mutable_step();
     step->set_request_id(NextRequestId());
     step->set_kind(kind);
-    return TrySendMoveOrTurnCommand(std::move(message));
+    if (!TrySendGameplayCommand(std::move(message)))
+    {
+        return false;
+    }
+    StartPredictedStepAnimation(kind);
+    return true;
 }
 
 bool ClientApp::SendSayRequest(const std::string& text)
@@ -442,14 +751,14 @@ bool ClientApp::SendSayRequest(const std::string& text)
     auto* say = message.mutable_say();
     say->set_request_id(NextRequestId());
     say->set_text(trimmed);
-    return SendMessage(std::move(message));
+    return TrySendGameplayCommand(std::move(message));
 }
 
 bool ClientApp::SendGuardRequest()
 {
     mud::v1::ClientMessage message;
     message.mutable_guard()->set_request_id(NextRequestId());
-    return SendMessage(std::move(message));
+    return TrySendGameplayCommand(std::move(message));
 }
 
 bool ClientApp::SendAttackRequest(mud::v1::WeaponKind weapon)
@@ -458,7 +767,7 @@ bool ClientApp::SendAttackRequest(mud::v1::WeaponKind weapon)
     auto* attack = message.mutable_attack();
     attack->set_request_id(NextRequestId());
     attack->set_weapon(weapon);
-    return SendMessage(std::move(message));
+    return TrySendGameplayCommand(std::move(message));
 }
 
 void ClientApp::QueueServerMessage(const mud::v1::ServerMessage& message)
@@ -590,11 +899,11 @@ void ClientApp::HandleServerMessageOnMainThread(const mud::v1::ServerMessage& me
         AddLog("[pong]");
         break;
     case mud::v1::ServerMessage::kTick:
+        UpdateTickIntervalEstimate(message.tick());
         TickDeathScreen();
         break;
     case mud::v1::ServerMessage::kView:
-        latest_view_ = message.view();
-        scene_dirty_ = true;
+        HandleViewUpdate(message.view());
         break;
     case mud::v1::ServerMessage::PAYLOAD_NOT_SET:
     default:
@@ -619,6 +928,11 @@ void ClientApp::HandleActionKey(char key)
     if (key == 'q')
     {
         running_.store(false, std::memory_order_relaxed);
+        return;
+    }
+
+    if (!connected_ || server_closed_.load(std::memory_order_relaxed))
+    {
         return;
     }
 
@@ -647,7 +961,6 @@ void ClientApp::HandleActionKey(char key)
         if (!session_.SendPing())
         {
             AddLog("[error] Failed to send ping.");
-            running_.store(false, std::memory_order_relaxed);
         }
         return;
     }
@@ -682,6 +995,12 @@ void ClientApp::HandleActionKey(char key)
 
 void ClientApp::HandleSubmittedText(const std::string& text)
 {
+    if (!connected_ || server_closed_.load(std::memory_order_relaxed))
+    {
+        AddLog("[connect] Connect first.");
+        return;
+    }
+
     if (death_screen_active_)
     {
         AddLog("[dead] Controls are disabled until respawn.");
@@ -781,7 +1100,6 @@ void ClientApp::HandleSubmittedText(const std::string& text)
         if (!session_.SendPing())
         {
             AddLog("[error] Failed to send ping.");
-            running_.store(false, std::memory_order_relaxed);
         }
         return;
     }
@@ -837,6 +1155,207 @@ void ClientApp::RequestInputFocus()
     input_focus_requested_ = true;
 }
 
+void ClientApp::HandleViewUpdate(const mud::v1::LocalViewUpdate& view)
+{
+    const float target_x = static_cast<float>(view.center_x()) * kCellSize;
+    const float target_z = static_cast<float>(view.center_y()) * kCellSize;
+    const float target_yaw = DirectionToYawRadians(view.facing());
+
+    if (!camera_pose_initialized_)
+    {
+        camera_pose_initialized_ = true;
+        camera_animating_ = false;
+        camera_current_x_ = target_x;
+        camera_current_z_ = target_z;
+        camera_current_yaw_ = target_yaw;
+        camera_start_x_ = target_x;
+        camera_start_z_ = target_z;
+        camera_start_yaw_ = target_yaw;
+        camera_target_x_ = target_x;
+        camera_target_z_ = target_z;
+        camera_target_yaw_ = target_yaw;
+    }
+    else
+    {
+        UpdateCameraAnimation();
+
+        const bool animate =
+            latest_view_.has_value() && IsSingleTickMoveOrTurn(*latest_view_, view);
+        if (animate)
+        {
+            camera_start_x_ = camera_current_x_;
+            camera_start_z_ = camera_current_z_;
+            camera_start_yaw_ = camera_current_yaw_;
+            camera_target_x_ = target_x;
+            camera_target_z_ = target_z;
+            camera_target_yaw_ = target_yaw;
+            camera_animation_started_at_ = std::chrono::steady_clock::now();
+            camera_animation_duration_ = std::chrono::milliseconds(
+                std::clamp(tick_interval_estimate_ms_, kMinTickIntervalEstimateMs,
+                           kMaxTickIntervalEstimateMs));
+            camera_animating_ = true;
+        }
+        else
+        {
+            camera_animating_ = false;
+            camera_current_x_ = target_x;
+            camera_current_z_ = target_z;
+            camera_current_yaw_ = target_yaw;
+            camera_start_x_ = target_x;
+            camera_start_z_ = target_z;
+            camera_start_yaw_ = target_yaw;
+            camera_target_x_ = target_x;
+            camera_target_z_ = target_z;
+            camera_target_yaw_ = target_yaw;
+        }
+    }
+
+    latest_view_ = view;
+    scene_dirty_ = true;
+}
+
+void ClientApp::UpdateTickIntervalEstimate(const mud::v1::TickEvent& tick)
+{
+    const std::uint64_t tick_id = tick.tick_id();
+    const std::uint64_t tick_time_ms = tick.server_time_ms();
+
+    if (last_tick_sample_id_ != 0 && last_tick_sample_time_ms_ != 0 &&
+        tick_id > last_tick_sample_id_ && tick_time_ms > last_tick_sample_time_ms_)
+    {
+        const std::uint64_t tick_delta = tick_id - last_tick_sample_id_;
+        const std::uint64_t time_delta_ms = tick_time_ms - last_tick_sample_time_ms_;
+        if (tick_delta > 0)
+        {
+            const std::uint64_t sample_ms = time_delta_ms / tick_delta;
+            if (sample_ms > 0)
+            {
+                const std::uint64_t smoothed_ms =
+                    ((tick_interval_estimate_ms_ * 3) + sample_ms) / 4;
+                tick_interval_estimate_ms_ =
+                    std::clamp(smoothed_ms, kMinTickIntervalEstimateMs,
+                               kMaxTickIntervalEstimateMs);
+            }
+        }
+    }
+
+    if (tick_id >= last_tick_sample_id_ && tick_time_ms >= last_tick_sample_time_ms_)
+    {
+        last_tick_sample_id_ = tick_id;
+        last_tick_sample_time_ms_ = tick_time_ms;
+    }
+}
+
+void ClientApp::UpdateCameraAnimation()
+{
+    if (!camera_pose_initialized_)
+    {
+        return;
+    }
+
+    if (!camera_animating_)
+    {
+        camera_current_x_ = camera_target_x_;
+        camera_current_z_ = camera_target_z_;
+        camera_current_yaw_ = camera_target_yaw_;
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - camera_animation_started_at_)
+            .count();
+    const std::int64_t duration_ms = std::max<std::int64_t>(1, camera_animation_duration_.count());
+    const float t =
+        std::clamp(static_cast<float>(elapsed_ms) / static_cast<float>(duration_ms), 0.0f, 1.0f);
+    const float eased_t = SmoothStep(t);
+
+    camera_current_x_ = camera_start_x_ + ((camera_target_x_ - camera_start_x_) * eased_t);
+    camera_current_z_ = camera_start_z_ + ((camera_target_z_ - camera_start_z_) * eased_t);
+    camera_current_yaw_ = LerpAngleRadians(camera_start_yaw_, camera_target_yaw_, eased_t);
+
+    if (t >= 1.0f)
+    {
+        camera_animating_ = false;
+        camera_current_x_ = camera_target_x_;
+        camera_current_z_ = camera_target_z_;
+        camera_current_yaw_ = camera_target_yaw_;
+    }
+}
+
+void ClientApp::StartPredictedStepAnimation(mud::v1::StepKind kind)
+{
+    if (!camera_pose_initialized_ || !latest_view_.has_value())
+    {
+        return;
+    }
+
+    mud::v1::LocalViewUpdate predicted_view = *latest_view_;
+    switch (kind)
+    {
+    case mud::v1::STEP_KIND_MOVE_FORWARD:
+    case mud::v1::STEP_KIND_MOVE_BACKWARD:
+    {
+        if (!CanPredictMoveFromCenter(predicted_view, kind))
+        {
+            return;
+        }
+
+        auto [dx, dy] = DirectionToGridDelta(predicted_view.facing());
+        if (kind == mud::v1::STEP_KIND_MOVE_BACKWARD)
+        {
+            dx = -dx;
+            dy = -dy;
+        }
+        predicted_view.set_center_x(predicted_view.center_x() + dx);
+        predicted_view.set_center_y(predicted_view.center_y() + dy);
+        break;
+    }
+    case mud::v1::STEP_KIND_TURN_LEFT:
+        predicted_view.set_facing(TurnLeftDirection(predicted_view.facing()));
+        break;
+    case mud::v1::STEP_KIND_TURN_RIGHT:
+        predicted_view.set_facing(TurnRightDirection(predicted_view.facing()));
+        break;
+    case mud::v1::STEP_KIND_UNSPECIFIED:
+    default:
+        return;
+    }
+
+    UpdateCameraAnimation();
+
+    const float target_x = static_cast<float>(predicted_view.center_x()) * kCellSize;
+    const float target_z = static_cast<float>(predicted_view.center_y()) * kCellSize;
+    const float target_yaw = DirectionToYawRadians(predicted_view.facing());
+
+    camera_start_x_ = camera_current_x_;
+    camera_start_z_ = camera_current_z_;
+    camera_start_yaw_ = camera_current_yaw_;
+    camera_target_x_ = target_x;
+    camera_target_z_ = target_z;
+    camera_target_yaw_ = target_yaw;
+    camera_animation_started_at_ = std::chrono::steady_clock::now();
+    camera_animation_duration_ =
+        std::chrono::milliseconds(std::clamp(tick_interval_estimate_ms_,
+                                             kMinTickIntervalEstimateMs,
+                                             kMaxTickIntervalEstimateMs));
+    camera_animating_ = true;
+}
+
+void ClientApp::ApplyCameraPose(frame::WindowInterface& window)
+{
+    if (!camera_pose_initialized_)
+    {
+        return;
+    }
+
+    auto& camera = window.GetDevice().GetLevel().GetDefaultCamera();
+    const float facing_x = std::cos(camera_current_yaw_);
+    const float facing_z = std::sin(camera_current_yaw_);
+
+    camera.SetPosition(glm::vec3(camera_current_x_, kCameraHeight, camera_current_z_));
+    camera.SetFront(glm::vec3(facing_x, 0.0f, facing_z));
+}
+
 std::string ClientApp::BuildBootstrapLevelJson() const
 {
     mud::v1::LocalViewUpdate bootstrap;
@@ -873,17 +1392,71 @@ std::string ClientApp::BuildLevelJsonFromView(const mud::v1::LocalViewUpdate& vi
     std::vector<CubeSpec> wall_cubes;
     std::vector<CubeSpec> player_cubes;
     std::vector<CubeSpec> npc_cubes;
+    std::unordered_set<std::int64_t> ground_coords;
+    std::unordered_set<std::int64_t> wall_coords;
+    ground_coords.reserve(static_cast<std::size_t>(view.squares_size()) * 3u);
+    wall_coords.reserve(static_cast<std::size_t>(view.squares_size()) * 2u);
+
+    for (const auto& square : view.squares())
+    {
+        const std::int64_t square_key = CoordKey(square.x(), square.y());
+        ground_coords.insert(square_key);
+
+        if (square.kind() == mud::v1::SQUARE_KIND_WALL)
+        {
+            wall_coords.insert(square_key);
+            continue;
+        }
+
+        if (!square.open_north() && !has_square(square.x(), square.y() - 1))
+        {
+            wall_coords.insert(CoordKey(square.x(), square.y() - 1));
+        }
+        if (!square.open_west() && !has_square(square.x() - 1, square.y()))
+        {
+            wall_coords.insert(CoordKey(square.x() - 1, square.y()));
+        }
+        if (!square.open_south() && !has_square(square.x(), square.y() + 1))
+        {
+            wall_coords.insert(CoordKey(square.x(), square.y() + 1));
+        }
+        if (!square.open_east() && !has_square(square.x() + 1, square.y()))
+        {
+            wall_coords.insert(CoordKey(square.x() + 1, square.y()));
+        }
+    }
+
+    if (ground_coords.empty())
+    {
+        ground_coords.insert(CoordKey(view.center_x(), view.center_y()));
+    }
+    for (const std::int64_t wall_key : wall_coords)
+    {
+        ground_coords.insert(wall_key);
+    }
 
     int min_square_x = view.center_x();
     int max_square_x = view.center_x();
     int min_square_y = view.center_y();
     int max_square_y = view.center_y();
-    for (const auto& square : view.squares())
+    for (const std::int64_t coord_key : ground_coords)
     {
-        min_square_x = std::min(min_square_x, square.x());
-        max_square_x = std::max(max_square_x, square.x());
-        min_square_y = std::min(min_square_y, square.y());
-        max_square_y = std::max(max_square_y, square.y());
+        const int x = CoordXFromKey(coord_key);
+        const int y = CoordYFromKey(coord_key);
+        min_square_x = std::min(min_square_x, x);
+        max_square_x = std::max(max_square_x, x);
+        min_square_y = std::min(min_square_y, y);
+        max_square_y = std::max(max_square_y, y);
+    }
+
+    // Keep the local ground watertight even when some interior cells are omitted from
+    // visibility (for example by LOS clipping around corners).
+    for (int y = min_square_y; y <= max_square_y; ++y)
+    {
+        for (int x = min_square_x; x <= max_square_x; ++x)
+        {
+            ground_coords.insert(CoordKey(x, y));
+        }
     }
 
     const float base_center_x =
@@ -899,39 +1472,20 @@ std::string ClientApp::BuildLevelJsonFromView(const mud::v1::LocalViewUpdate& vi
     AddCubeSpec(floor_cubes, base_center_x, kBaseFloorCenterY, base_center_z, base_span_x,
                 kBaseFloorThickness, base_span_z);
 
-    for (const auto& square : view.squares())
+    for (const std::int64_t ground_key : ground_coords)
     {
-        const float x = static_cast<float>(square.x()) * kCellSize;
-        const float z = static_cast<float>(square.y()) * kCellSize;
+        const float x = static_cast<float>(CoordXFromKey(ground_key)) * kCellSize;
+        const float z = static_cast<float>(CoordYFromKey(ground_key)) * kCellSize;
+        AddCubeSpec(floor_cubes, x, kFloorCenterY, z, kFloorTileSize, kFloorThickness,
+                    kFloorTileSize);
+    }
 
-        if (square.kind() == mud::v1::SQUARE_KIND_WALL)
-        {
-            AddCubeSpec(wall_cubes, x, kWallCenterY, z, kWallCubeSize, kWallHeight, kWallCubeSize);
-            continue;
-        }
-
-        AddCubeSpec(floor_cubes, x, kFloorCenterY, z, kCellSize, kFloorThickness, kCellSize);
-
-        if (!square.open_north() && !has_square(square.x(), square.y() - 1))
-        {
-            AddCubeSpec(wall_cubes, x, kWallCenterY, z - kHalfCell, kCellSize, kWallHeight,
-                        kWallThickness);
-        }
-        if (!square.open_west() && !has_square(square.x() - 1, square.y()))
-        {
-            AddCubeSpec(wall_cubes, x - kHalfCell, kWallCenterY, z, kWallThickness, kWallHeight,
-                        kCellSize);
-        }
-        if (!square.open_south() && !has_square(square.x(), square.y() + 1))
-        {
-            AddCubeSpec(wall_cubes, x, kWallCenterY, z + kHalfCell, kCellSize, kWallHeight,
-                        kWallThickness);
-        }
-        if (!square.open_east() && !has_square(square.x() + 1, square.y()))
-        {
-            AddCubeSpec(wall_cubes, x + kHalfCell, kWallCenterY, z, kWallThickness, kWallHeight,
-                        kCellSize);
-        }
+    for (const std::int64_t wall_key : wall_coords)
+    {
+        const float wall_x = static_cast<float>(CoordXFromKey(wall_key)) * kCellSize;
+        const float wall_z = static_cast<float>(CoordYFromKey(wall_key)) * kCellSize;
+        AddCubeSpec(wall_cubes, wall_x, kWallCenterY, wall_z, kWallCubeSize, kWallHeight,
+                    kWallCubeSize);
     }
 
     for (const auto& actor : view.actors())
@@ -962,6 +1516,16 @@ std::string ClientApp::BuildLevelJsonFromView(const mud::v1::LocalViewUpdate& vi
     WriteRaytraceObj(model_root / "grpcmud_player.obj", player_cubes);
     WriteRaytraceObj(model_root / "grpcmud_npc.obj", npc_cubes);
 
+    const std::uint64_t geometry_hash =
+        Fnv1aAppend(
+            Fnv1aAppend(
+                Fnv1aAppend(HashCubeSpecs(floor_cubes), HashCubeSpecs(wall_cubes)),
+                HashCubeSpecs(player_cubes)),
+            HashCubeSpecs(npc_cubes));
+    std::ostringstream geometry_revision;
+    geometry_revision << std::hex << std::setw(16) << std::setfill('0') << geometry_hash;
+    const std::string scene_name = "grpcMUDRaytrace-" + geometry_revision.str();
+
     const float cam_x = static_cast<float>(view.center_x()) * kCellSize;
     const float cam_z = static_cast<float>(view.center_y()) * kCellSize;
     const FacingVec facing = ToFacingVec(view.facing());
@@ -970,7 +1534,7 @@ std::string ClientApp::BuildLevelJsonFromView(const mud::v1::LocalViewUpdate& vi
 
     std::ostringstream json;
     json << "{"
-         << "\"name\":\"grpcMUDRaytrace\","
+         << "\"name\":\"" << scene_name << "\","
          << "\"default_texture_name\":\"billboard\","
          << "\"textures\":[{"
          << "\"name\":\"billboard\","
@@ -978,15 +1542,37 @@ std::string ClientApp::BuildLevelJsonFromView(const mud::v1::LocalViewUpdate& vi
          << "\"cubemap\":false,"
          << "\"pixel_element_size\":{\"value\":\"BYTE\"},"
          << "\"pixel_structure\":{\"value\":\"RGB\"}"
+         << "},{"
+         << "\"name\":\"ground_texture\","
+         << "\"cubemap\":false,"
+         << "\"pixel_element_size\":{\"value\":\"BYTE\"},"
+         << "\"pixel_structure\":{\"value\":\"RGB\"},"
+         << "\"file_name\":\"asset/texture/grpcmud_ground_grass.png\""
+         << "},{"
+         << "\"name\":\"wall_texture\","
+         << "\"cubemap\":false,"
+         << "\"pixel_element_size\":{\"value\":\"BYTE\"},"
+         << "\"pixel_structure\":{\"value\":\"RGB\"},"
+         << "\"file_name\":\"asset/texture/grpcmud_wall_rock.jpg\""
          << "}],"
          << "\"programs\":["
          << "{"
          << "\"name\":\"RayTraceProgram\","
          << "\"output_texture_names\":[\"billboard\"],"
+         << "\"input_texture_names\":[\"ground_texture\",\"wall_texture\"],"
          << "\"input_scene_type\":{\"value\":\"QUAD\"},"
          << "\"shader_vertex\":\"grpcmud_raytrace.vert\","
          << "\"shader_fragment\":\"grpcmud_raytrace.frag\","
          << "\"shader_compute\":\"\""
+         << ",\"bindings\":["
+         << "{\"name\":\"ground_texture\",\"binding\":0,\"binding_type\":\"COMBINED_IMAGE_SAMPLER\",\"stages\":[\"FRAGMENT\"]},"
+         << "{\"name\":\"wall_texture\",\"binding\":1,\"binding_type\":\"COMBINED_IMAGE_SAMPLER\",\"stages\":[\"FRAGMENT\"]},"
+         << "{\"name\":\"FloorTriangles\",\"binding\":2,\"binding_type\":\"STORAGE_BUFFER\",\"stages\":[\"FRAGMENT\"]},"
+         << "{\"name\":\"WallTriangles\",\"binding\":3,\"binding_type\":\"STORAGE_BUFFER\",\"stages\":[\"FRAGMENT\"]},"
+         << "{\"name\":\"PlayerTriangles\",\"binding\":4,\"binding_type\":\"STORAGE_BUFFER\",\"stages\":[\"FRAGMENT\"]},"
+         << "{\"name\":\"NpcTriangles\",\"binding\":5,\"binding_type\":\"STORAGE_BUFFER\",\"stages\":[\"FRAGMENT\"]},"
+         << "{\"name\":\"UniformBlock\",\"binding\":6,\"binding_type\":\"UNIFORM_BUFFER\",\"stages\":[\"FRAGMENT\"]}"
+         << "]"
          << ",\"uniforms\":["
          << "{\"name\":\"projection_inv\",\"uniform_enum\":\"PROJECTION_INV_MAT4\"},"
          << "{\"name\":\"view_inv\",\"uniform_enum\":\"VIEW_INV_MAT4\"},"
@@ -1011,11 +1597,16 @@ std::string ClientApp::BuildLevelJsonFromView(const mud::v1::LocalViewUpdate& vi
          << "{"
          << "\"name\":\"RayTraceMaterial\","
          << "\"program_name\":\"RayTraceProgram\","
-         << "\"preprocess_program_name\":\"RayTracePreprocessProgram\","
-         << "\"texture_names\":[],"
-         << "\"inner_names\":[],"
+         << "\"texture_names\":[\"ground_texture\",\"wall_texture\"],"
+         << "\"inner_names\":[\"ground_texture\",\"wall_texture\"],"
          << "\"buffer_names\":[\"FloorMesh.0.triangle\",\"WallMesh.0.triangle\",\"PlayerMesh.0.triangle\",\"NpcMesh.0.triangle\"],"
          << "\"inner_buffer_names\":[\"FloorTriangles\",\"WallTriangles\",\"PlayerTriangles\",\"NpcTriangles\"]"
+         << "},"
+         << "{"
+         << "\"name\":\"RayTracePreprocessMaterial\","
+         << "\"program_name\":\"RayTracePreprocessProgram\","
+         << "\"texture_names\":[],"
+         << "\"inner_names\":[]"
          << "}"
          << "],"
          << "\"scene_tree\":{"
@@ -1037,10 +1628,10 @@ std::string ClientApp::BuildLevelJsonFromView(const mud::v1::LocalViewUpdate& vi
          << "}],"
          << "\"node_static_meshes\":["
          << "{\"name\":\"RayTracingRendering\",\"parent\":\"root\",\"mesh_enum\":\"QUAD\",\"material_name\":\"RayTraceMaterial\"},"
-         << "{\"name\":\"FloorMesh\",\"parent\":\"root\",\"file_name\":\"grpcmud_floor.obj\",\"material_name\":\"RayTraceMaterial\",\"render_time_enum\":\"PRE_RENDER_TIME\"},"
-         << "{\"name\":\"WallMesh\",\"parent\":\"root\",\"file_name\":\"grpcmud_wall.obj\",\"material_name\":\"RayTraceMaterial\",\"render_time_enum\":\"PRE_RENDER_TIME\"},"
-         << "{\"name\":\"PlayerMesh\",\"parent\":\"root\",\"file_name\":\"grpcmud_player.obj\",\"material_name\":\"RayTraceMaterial\",\"render_time_enum\":\"PRE_RENDER_TIME\"},"
-         << "{\"name\":\"NpcMesh\",\"parent\":\"root\",\"file_name\":\"grpcmud_npc.obj\",\"material_name\":\"RayTraceMaterial\",\"render_time_enum\":\"PRE_RENDER_TIME\"}"
+         << "{\"name\":\"FloorMesh\",\"parent\":\"root\",\"file_name\":\"grpcmud_floor.obj\",\"material_name\":\"RayTracePreprocessMaterial\",\"render_time_enum\":\"PRE_RENDER_TIME\"},"
+         << "{\"name\":\"WallMesh\",\"parent\":\"root\",\"file_name\":\"grpcmud_wall.obj\",\"material_name\":\"RayTracePreprocessMaterial\",\"render_time_enum\":\"PRE_RENDER_TIME\"},"
+         << "{\"name\":\"PlayerMesh\",\"parent\":\"root\",\"file_name\":\"grpcmud_player.obj\",\"material_name\":\"RayTracePreprocessMaterial\",\"render_time_enum\":\"PRE_RENDER_TIME\"},"
+         << "{\"name\":\"NpcMesh\",\"parent\":\"root\",\"file_name\":\"grpcmud_npc.obj\",\"material_name\":\"RayTracePreprocessMaterial\",\"render_time_enum\":\"PRE_RENDER_TIME\"}"
          << "],"
          << "\"node_lights\":[]"
          << "}"
@@ -1060,8 +1651,29 @@ bool ClientApp::RebuildSceneIfDirty(frame::WindowInterface& window)
     {
         const std::string level_json =
             latest_view_ ? BuildLevelJsonFromView(*latest_view_) : BuildBootstrapLevelJson();
-        auto level = frame::json::ParseLevel(window.GetSize(), level_json);
-        window.GetDevice().Startup(std::move(level));
+        if (level_json == last_level_json_)
+        {
+            return true;
+        }
+
+        if (window.GetDevice().GetDeviceEnum() == frame::RenderingAPIEnum::VULKAN)
+        {
+            const auto asset_root = frame::file::FindDirectory("asset");
+            const auto level_data = frame::json::ParseLevelData(window.GetSize(), level_json,
+                                                                asset_root);
+            auto* vulkan_device = dynamic_cast<frame::vulkan::Device*>(&window.GetDevice());
+            if (!vulkan_device)
+            {
+                throw std::runtime_error("Vulkan device not available.");
+            }
+            vulkan_device->StartupFromLevelData(level_data);
+        }
+        else
+        {
+            auto level = frame::json::ParseLevel(window.GetSize(), level_json);
+            window.GetDevice().Startup(std::move(level));
+        }
+        last_level_json_ = level_json;
     }
     catch (const std::exception& ex)
     {
@@ -1075,16 +1687,69 @@ bool ClientApp::RebuildSceneIfDirty(frame::WindowInterface& window)
 bool ClientApp::RenderFrame(frame::WindowInterface& window)
 {
     ProcessQueuedServerMessages();
+    UpdateCameraAnimation();
     if (!RebuildSceneIfDirty(window))
     {
         return running_.load(std::memory_order_relaxed);
     }
+    ApplyCameraPose(window);
     return running_.load(std::memory_order_relaxed);
 }
 
 bool ClientApp::DrawHud()
 {
     ImGui::TextUnformatted("grpcMUD - 3D client");
+    if (!connected_)
+    {
+        ImGui::TextUnformatted("Connect to start playing.");
+        if (!connect_error_message_.empty())
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s",
+                               connect_error_message_.c_str());
+        }
+
+        bool submit_connect = false;
+        submit_connect |=
+            ImGui::InputText("Server", server_address_input_buffer_.data(),
+                             server_address_input_buffer_.size(),
+                             ImGuiInputTextFlags_EnterReturnsTrue);
+        const bool server_input_focused = ImGui::IsItemActive() || ImGui::IsItemFocused();
+        submit_connect |=
+            ImGui::InputText("Player Name", player_name_input_buffer_.data(),
+                             player_name_input_buffer_.size(),
+                             ImGuiInputTextFlags_EnterReturnsTrue);
+        const bool player_input_focused = ImGui::IsItemActive() || ImGui::IsItemFocused();
+        SetInputFocused(server_input_focused || player_input_focused);
+
+        if (ImGui::Button("Connect"))
+        {
+            submit_connect = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Quit"))
+        {
+            running_.store(false, std::memory_order_relaxed);
+        }
+
+        if (submit_connect)
+        {
+            TryConnect();
+        }
+
+        ImGui::Separator();
+        ImGui::BeginChild("grpcmud_log_view", ImVec2(0.0f, 260.0f), true);
+        for (const auto& line : logs_)
+        {
+            ImGui::TextWrapped("%s", line.c_str());
+        }
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+        {
+            ImGui::SetScrollHereY(1.0f);
+        }
+        ImGui::EndChild();
+        return true;
+    }
+
     if (death_screen_active_)
     {
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
@@ -1102,7 +1767,6 @@ bool ClientApp::DrawHud()
         if (!session_.SendPing())
         {
             AddLog("[error] Failed to send ping.");
-            running_.store(false, std::memory_order_relaxed);
         }
     }
 
@@ -1186,12 +1850,12 @@ void ClientApp::RegisterKeyBindings(frame::WindowInterface& window)
                           });
 }
 
-bool ClientApp::TrySendMoveOrTurnCommand(mud::v1::ClientMessage message)
+bool ClientApp::TrySendGameplayCommand(mud::v1::ClientMessage message)
 {
     const std::uint64_t current_tick = latest_tick_id_.load(std::memory_order_relaxed);
-    if (move_command_sent_this_tick_ && current_tick == last_move_command_tick_id_)
+    if (gameplay_command_sent_this_tick_ && current_tick == last_gameplay_command_tick_id_)
     {
-        AddLog("[move] One move/turn per tick. Wait for next tick.");
+        AddLog("[tick] One command per tick. Wait for next tick.");
         return false;
     }
 
@@ -1200,8 +1864,8 @@ bool ClientApp::TrySendMoveOrTurnCommand(mud::v1::ClientMessage message)
         return false;
     }
 
-    move_command_sent_this_tick_ = true;
-    last_move_command_tick_id_ = current_tick;
+    gameplay_command_sent_this_tick_ = true;
+    last_gameplay_command_tick_id_ = current_tick;
     return true;
 }
 } // namespace grpcmud::client
