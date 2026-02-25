@@ -10,23 +10,17 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
-#include <cstring>
 #include <filesystem>
-#include <fstream>
-#include <functional>
-#include <iomanip>
 #include <iostream>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
-#include <vector>
 
 #include <glm/glm.hpp>
 
+#include "MudHudWindow.hpp"
+#include "SceneLevelBuilder.hpp"
+#include "ViewMath.hpp"
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
 #include "frame/api.h"
@@ -52,412 +46,9 @@ namespace
 {
 constexpr std::size_t kMaxLogLines = 128;
 constexpr glm::uvec2 kDefaultWindowSize{1280u, 720u};
-constexpr float kCellSize = 2.0f;
-constexpr float kHalfCell = kCellSize * 0.5f;
-constexpr float kFloorThickness = 0.10f;
-constexpr float kFloorTileSize = kCellSize + 0.02f;
-constexpr float kFloorCenterY = -0.62f;
-constexpr float kGroundY = kFloorCenterY + (kFloorThickness * 0.5f);
-constexpr float kBaseFloorThickness = 0.08f;
-constexpr float kBaseFloorCenterY = -0.72f;
-constexpr float kBaseFloorMarginCells = 2.0f;
-constexpr float kWallThickness = 0.18f;
-constexpr float kWallHeight = 2.3f;
-constexpr float kWallCenterY = kGroundY + (kWallHeight * 0.5f) - 0.04f;
-constexpr float kWallCubeSize = kCellSize + 0.02f;
-constexpr float kPlayerHeight = 1.75f;
-constexpr float kPlayerWidth = 0.55f;
-constexpr float kNpcHeight = 1.55f;
-constexpr float kNpcWidth = 0.65f;
-constexpr float kCameraHeight = 0.92f;
-constexpr float kCameraForwardDistance = 2.0f;
-constexpr float kCameraNearClip = 0.12f;
-constexpr float kPi = 3.14159265358979323846f;
 constexpr std::uint64_t kMinTickIntervalEstimateMs = 100;
 constexpr std::uint64_t kMaxTickIntervalEstimateMs = 1500;
-
-std::int64_t CoordKey(int x, int y)
-{
-    return (static_cast<std::int64_t>(x) << 32) ^ static_cast<std::uint32_t>(y);
-}
-
-int CoordXFromKey(std::int64_t key)
-{
-    return static_cast<std::int32_t>(key >> 32);
-}
-
-int CoordYFromKey(std::int64_t key)
-{
-    return static_cast<std::int32_t>(key & 0xFFFFFFFF);
-}
-
-struct FacingVec
-{
-    float x = 0.0f;
-    float z = -1.0f;
-};
-
-FacingVec ToFacingVec(mud::v1::Direction direction)
-{
-    switch (direction)
-    {
-    case mud::v1::DIRECTION_NORTH:
-        return {0.0f, -1.0f};
-    case mud::v1::DIRECTION_EAST:
-        return {1.0f, 0.0f};
-    case mud::v1::DIRECTION_SOUTH:
-        return {0.0f, 1.0f};
-    case mud::v1::DIRECTION_WEST:
-        return {-1.0f, 0.0f};
-    case mud::v1::DIRECTION_UNSPECIFIED:
-    default:
-        return {0.0f, -1.0f};
-    }
-}
-
-mud::v1::Direction TurnLeftDirection(mud::v1::Direction direction)
-{
-    switch (direction)
-    {
-    case mud::v1::DIRECTION_NORTH:
-        return mud::v1::DIRECTION_WEST;
-    case mud::v1::DIRECTION_WEST:
-        return mud::v1::DIRECTION_SOUTH;
-    case mud::v1::DIRECTION_SOUTH:
-        return mud::v1::DIRECTION_EAST;
-    case mud::v1::DIRECTION_EAST:
-        return mud::v1::DIRECTION_NORTH;
-    case mud::v1::DIRECTION_UNSPECIFIED:
-    default:
-        return mud::v1::DIRECTION_NORTH;
-    }
-}
-
-mud::v1::Direction TurnRightDirection(mud::v1::Direction direction)
-{
-    switch (direction)
-    {
-    case mud::v1::DIRECTION_NORTH:
-        return mud::v1::DIRECTION_EAST;
-    case mud::v1::DIRECTION_EAST:
-        return mud::v1::DIRECTION_SOUTH;
-    case mud::v1::DIRECTION_SOUTH:
-        return mud::v1::DIRECTION_WEST;
-    case mud::v1::DIRECTION_WEST:
-        return mud::v1::DIRECTION_NORTH;
-    case mud::v1::DIRECTION_UNSPECIFIED:
-    default:
-        return mud::v1::DIRECTION_NORTH;
-    }
-}
-
-std::pair<int, int> DirectionToGridDelta(mud::v1::Direction direction)
-{
-    switch (direction)
-    {
-    case mud::v1::DIRECTION_NORTH:
-        return {0, -1};
-    case mud::v1::DIRECTION_EAST:
-        return {1, 0};
-    case mud::v1::DIRECTION_SOUTH:
-        return {0, 1};
-    case mud::v1::DIRECTION_WEST:
-        return {-1, 0};
-    case mud::v1::DIRECTION_UNSPECIFIED:
-    default:
-        return {0, -1};
-    }
-}
-
-const mud::v1::VisibleSquare* FindCenterSquare(const mud::v1::LocalViewUpdate& view)
-{
-    for (const auto& square : view.squares())
-    {
-        if (square.x() == view.center_x() && square.y() == view.center_y())
-        {
-            return &square;
-        }
-    }
-    return nullptr;
-}
-
-bool CanPredictMoveFromCenter(const mud::v1::LocalViewUpdate& view, mud::v1::StepKind kind)
-{
-    const mud::v1::VisibleSquare* center = FindCenterSquare(view);
-    if (!center)
-    {
-        return true;
-    }
-
-    mud::v1::Direction movement_direction = view.facing();
-    if (kind == mud::v1::STEP_KIND_MOVE_BACKWARD)
-    {
-        movement_direction = TurnLeftDirection(TurnLeftDirection(movement_direction));
-    }
-
-    auto is_cell_occupied_by_actor = [&](int x, int y) {
-        for (const auto& actor : view.actors())
-        {
-            if (actor.kind() == mud::v1::VisibleActor::KIND_SELF)
-            {
-                continue;
-            }
-            if (actor.x() == x && actor.y() == y)
-            {
-                return true;
-            }
-        }
-        return false;
-    };
-
-    const auto [dx, dy] = DirectionToGridDelta(movement_direction);
-    const int target_x = view.center_x() + dx;
-    const int target_y = view.center_y() + dy;
-
-    switch (movement_direction)
-    {
-    case mud::v1::DIRECTION_NORTH:
-        return center->open_north() && !is_cell_occupied_by_actor(target_x, target_y);
-    case mud::v1::DIRECTION_EAST:
-        return center->open_east() && !is_cell_occupied_by_actor(target_x, target_y);
-    case mud::v1::DIRECTION_SOUTH:
-        return center->open_south() && !is_cell_occupied_by_actor(target_x, target_y);
-    case mud::v1::DIRECTION_WEST:
-        return center->open_west() && !is_cell_occupied_by_actor(target_x, target_y);
-    case mud::v1::DIRECTION_UNSPECIFIED:
-    default:
-        return true;
-    }
-}
-
-float DirectionToYawRadians(mud::v1::Direction direction)
-{
-    const FacingVec facing = ToFacingVec(direction);
-    return std::atan2(facing.z, facing.x);
-}
-
-float NormalizeAngleRadians(float radians)
-{
-    const float two_pi = 2.0f * kPi;
-    float wrapped = std::fmod(radians + kPi, two_pi);
-    if (wrapped < 0.0f)
-    {
-        wrapped += two_pi;
-    }
-    return wrapped - kPi;
-}
-
-float LerpAngleRadians(float from, float to, float t)
-{
-    return from + (NormalizeAngleRadians(to - from) * t);
-}
-
-float SmoothStep(float t)
-{
-    t = std::clamp(t, 0.0f, 1.0f);
-    return t * t * (3.0f - (2.0f * t));
-}
-
-bool IsSingleTickMoveOrTurn(const mud::v1::LocalViewUpdate& from,
-                            const mud::v1::LocalViewUpdate& to)
-{
-    const int dx = to.center_x() - from.center_x();
-    const int dy = to.center_y() - from.center_y();
-    const int manhattan = std::abs(dx) + std::abs(dy);
-    if (manhattan == 1)
-    {
-        return true;
-    }
-
-    if (manhattan != 0)
-    {
-        return false;
-    }
-
-    const float from_yaw = DirectionToYawRadians(from.facing());
-    const float to_yaw = DirectionToYawRadians(to.facing());
-    const float yaw_delta = std::abs(NormalizeAngleRadians(to_yaw - from_yaw));
-    return yaw_delta > 0.01f && yaw_delta <= (kPi * 0.75f);
-}
-
-struct CubeSpec
-{
-    float tx = 0.0f;
-    float ty = 0.0f;
-    float tz = 0.0f;
-    float sx = 1.0f;
-    float sy = 1.0f;
-    float sz = 1.0f;
-};
-
-void AddCubeSpec(std::vector<CubeSpec>& cubes, float tx, float ty, float tz, float sx, float sy,
-                 float sz)
-{
-    cubes.push_back(CubeSpec{tx, ty, tz, sx, sy, sz});
-}
-
-std::uint64_t Fnv1aAppend(std::uint64_t hash, std::uint64_t value)
-{
-    constexpr std::uint64_t kFnvPrime = 1099511628211ull;
-    for (int i = 0; i < 8; ++i)
-    {
-        const std::uint8_t byte = static_cast<std::uint8_t>((value >> (i * 8)) & 0xFFu);
-        hash ^= byte;
-        hash *= kFnvPrime;
-    }
-    return hash;
-}
-
-std::uint32_t FloatBits(float value)
-{
-    std::uint32_t bits = 0;
-    static_assert(sizeof(bits) == sizeof(value));
-    std::memcpy(&bits, &value, sizeof(bits));
-    return bits;
-}
-
-std::uint64_t HashCubeSpecs(const std::vector<CubeSpec>& cubes)
-{
-    std::uint64_t hash = 1469598103934665603ull;
-    hash = Fnv1aAppend(hash, static_cast<std::uint64_t>(cubes.size()));
-    for (const CubeSpec& cube : cubes)
-    {
-        hash = Fnv1aAppend(hash, FloatBits(cube.tx));
-        hash = Fnv1aAppend(hash, FloatBits(cube.ty));
-        hash = Fnv1aAppend(hash, FloatBits(cube.tz));
-        hash = Fnv1aAppend(hash, FloatBits(cube.sx));
-        hash = Fnv1aAppend(hash, FloatBits(cube.sy));
-        hash = Fnv1aAppend(hash, FloatBits(cube.sz));
-    }
-    return hash;
-}
-
-void WriteRaytraceObj(const std::filesystem::path& path, const std::vector<CubeSpec>& cubes)
-{
-    std::vector<CubeSpec> final_cubes = cubes;
-    if (final_cubes.empty())
-    {
-        final_cubes.push_back(CubeSpec{100000.0f, -100000.0f, 100000.0f, 0.01f, 0.01f, 0.01f});
-    }
-
-    std::ostringstream generated;
-    generated << "# generated by grpcMUD client\n";
-    generated << "o mesh\n";
-    generated << std::fixed << std::setprecision(5);
-
-    int next_index = 1;
-    const auto emit_quad = [&](const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
-                               const glm::vec3& d, const glm::vec3& normal)
-    {
-        const int base = next_index;
-        const std::array<glm::vec3, 4> points{a, b, c, d};
-        const std::array<glm::vec2, 4> uv{{{0.0f, 0.0f},
-                                           {1.0f, 0.0f},
-                                           {1.0f, 1.0f},
-                                           {0.0f, 1.0f}}};
-        for (std::size_t i = 0; i < points.size(); ++i)
-        {
-            generated << "v " << points[i].x << ' ' << points[i].y << ' ' << points[i].z << '\n';
-            generated << "vt " << uv[i].x << ' ' << uv[i].y << '\n';
-            generated << "vn " << normal.x << ' ' << normal.y << ' ' << normal.z << '\n';
-        }
-        generated << "f " << base << '/' << base << '/' << base << ' ' << (base + 1) << '/'
-                  << (base + 1) << '/' << (base + 1) << ' ' << (base + 2) << '/'
-                  << (base + 2) << '/' << (base + 2) << '\n';
-        generated << "f " << base << '/' << base << '/' << base << ' ' << (base + 2) << '/'
-                  << (base + 2) << '/' << (base + 2) << ' ' << (base + 3) << '/'
-                  << (base + 3) << '/' << (base + 3) << '\n';
-        next_index += 4;
-    };
-
-    for (const CubeSpec& cube : final_cubes)
-    {
-        const float min_x = cube.tx - (cube.sx * 0.5f);
-        const float max_x = cube.tx + (cube.sx * 0.5f);
-        const float min_y = cube.ty - (cube.sy * 0.5f);
-        const float max_y = cube.ty + (cube.sy * 0.5f);
-        const float min_z = cube.tz - (cube.sz * 0.5f);
-        const float max_z = cube.tz + (cube.sz * 0.5f);
-
-        emit_quad(glm::vec3(min_x, min_y, min_z), glm::vec3(max_x, min_y, min_z),
-                  glm::vec3(max_x, max_y, min_z), glm::vec3(min_x, max_y, min_z),
-                  glm::vec3(0.0f, 0.0f, -1.0f));
-        emit_quad(glm::vec3(max_x, min_y, max_z), glm::vec3(min_x, min_y, max_z),
-                  glm::vec3(min_x, max_y, max_z), glm::vec3(max_x, max_y, max_z),
-                  glm::vec3(0.0f, 0.0f, 1.0f));
-        emit_quad(glm::vec3(min_x, min_y, max_z), glm::vec3(min_x, min_y, min_z),
-                  glm::vec3(min_x, max_y, min_z), glm::vec3(min_x, max_y, max_z),
-                  glm::vec3(-1.0f, 0.0f, 0.0f));
-        emit_quad(glm::vec3(max_x, min_y, min_z), glm::vec3(max_x, min_y, max_z),
-                  glm::vec3(max_x, max_y, max_z), glm::vec3(max_x, max_y, min_z),
-                  glm::vec3(1.0f, 0.0f, 0.0f));
-        emit_quad(glm::vec3(min_x, min_y, max_z), glm::vec3(max_x, min_y, max_z),
-                  glm::vec3(max_x, min_y, min_z), glm::vec3(min_x, min_y, min_z),
-                  glm::vec3(0.0f, -1.0f, 0.0f));
-        emit_quad(glm::vec3(min_x, max_y, min_z), glm::vec3(max_x, max_y, min_z),
-                  glm::vec3(max_x, max_y, max_z), glm::vec3(min_x, max_y, max_z),
-                  glm::vec3(0.0f, 1.0f, 0.0f));
-    }
-
-    const std::string generated_obj = generated.str();
-    {
-        std::ifstream current(path, std::ios::binary);
-        if (current.is_open())
-        {
-            std::ostringstream existing;
-            existing << current.rdbuf();
-            if (existing.str() == generated_obj)
-            {
-                return;
-            }
-        }
-    }
-
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out.is_open())
-    {
-        throw std::runtime_error("Failed to write OBJ file: " + path.string());
-    }
-    out << generated_obj;
-    out.flush();
-    if (!out.good())
-    {
-        throw std::runtime_error("Failed to flush OBJ file: " + path.string());
-    }
-}
-
-class MudHudWindow final : public frame::gui::GuiWindowInterface
-{
-public:
-    explicit MudHudWindow(std::function<bool()> draw_callback)
-        : draw_callback_(std::move(draw_callback))
-    {
-    }
-
-    bool DrawCallback() override
-    {
-        return draw_callback_();
-    }
-
-    bool End() const override
-    {
-        return false;
-    }
-
-    std::string GetName() const override
-    {
-        return name_;
-    }
-
-    void SetName(const std::string& name) override
-    {
-        name_ = name;
-    }
-
-private:
-    std::function<bool()> draw_callback_;
-    std::string name_ = "grpcMUD HUD";
-};
+using namespace grpcmud::client::viewmath;
 } // namespace
 
 int ClientApp::Run(int argc, char** argv)
@@ -608,37 +199,6 @@ std::string ClientApp::ToLower(std::string text)
     return text;
 }
 
-std::string ClientApp::JsonEscape(const std::string& text)
-{
-    std::string escaped;
-    escaped.reserve(text.size() + 16);
-    for (const char c : text)
-    {
-        switch (c)
-        {
-        case '\\':
-            escaped += "\\\\";
-            break;
-        case '"':
-            escaped += "\\\"";
-            break;
-        case '\n':
-            escaped += "\\n";
-            break;
-        case '\r':
-            escaped += "\\r";
-            break;
-        case '\t':
-            escaped += "\\t";
-            break;
-        default:
-            escaped.push_back(c);
-            break;
-        }
-    }
-    return escaped;
-}
-
 bool ClientApp::TryConnect()
 {
     if (connected_)
@@ -677,6 +237,8 @@ bool ClientApp::TryConnect()
     connect_error_message_.clear();
     server_closed_.store(false, std::memory_order_relaxed);
     server_closed_logged_ = false;
+    last_scene_signature_.reset();
+    scene_dirty_ = true;
 
     session_.StartReader(
         [this](const mud::v1::ServerMessage& message) { QueueServerMessage(message); },
@@ -1157,8 +719,8 @@ void ClientApp::RequestInputFocus()
 
 void ClientApp::HandleViewUpdate(const mud::v1::LocalViewUpdate& view)
 {
-    const float target_x = static_cast<float>(view.center_x()) * kCellSize;
-    const float target_z = static_cast<float>(view.center_y()) * kCellSize;
+    const float target_x = static_cast<float>(view.center_x()) * scene::kCellSize;
+    const float target_z = static_cast<float>(view.center_y()) * scene::kCellSize;
     const float target_yaw = DirectionToYawRadians(view.facing());
 
     if (!camera_pose_initialized_)
@@ -1210,8 +772,16 @@ void ClientApp::HandleViewUpdate(const mud::v1::LocalViewUpdate& view)
         }
     }
 
+    const std::uint64_t signature = scene::ComputeRelativeSceneSignature(view);
+    const bool scene_changed =
+        !last_scene_signature_.has_value() || last_scene_signature_.value() != signature;
+    last_scene_signature_ = signature;
+
     latest_view_ = view;
-    scene_dirty_ = true;
+    if (scene_changed)
+    {
+        scene_dirty_ = true;
+    }
 }
 
 void ClientApp::UpdateTickIntervalEstimate(const mud::v1::TickEvent& tick)
@@ -1323,8 +893,8 @@ void ClientApp::StartPredictedStepAnimation(mud::v1::StepKind kind)
 
     UpdateCameraAnimation();
 
-    const float target_x = static_cast<float>(predicted_view.center_x()) * kCellSize;
-    const float target_z = static_cast<float>(predicted_view.center_y()) * kCellSize;
+    const float target_x = static_cast<float>(predicted_view.center_x()) * scene::kCellSize;
+    const float target_z = static_cast<float>(predicted_view.center_y()) * scene::kCellSize;
     const float target_yaw = DirectionToYawRadians(predicted_view.facing());
 
     camera_start_x_ = camera_current_x_;
@@ -1352,291 +922,9 @@ void ClientApp::ApplyCameraPose(frame::WindowInterface& window)
     const float facing_x = std::cos(camera_current_yaw_);
     const float facing_z = std::sin(camera_current_yaw_);
 
-    camera.SetPosition(glm::vec3(camera_current_x_, kCameraHeight, camera_current_z_));
+    camera.SetPosition(
+        glm::vec3(camera_current_x_, scene::kCameraHeight, camera_current_z_));
     camera.SetFront(glm::vec3(facing_x, 0.0f, facing_z));
-}
-
-std::string ClientApp::BuildBootstrapLevelJson() const
-{
-    mud::v1::LocalViewUpdate bootstrap;
-    bootstrap.set_center_x(0);
-    bootstrap.set_center_y(0);
-    bootstrap.set_facing(mud::v1::DIRECTION_NORTH);
-    auto* square = bootstrap.add_squares();
-    square->set_square_id("bootstrap");
-    square->set_x(0);
-    square->set_y(0);
-    square->set_kind(mud::v1::SQUARE_KIND_FLOOR);
-    square->set_open_north(true);
-    square->set_open_east(true);
-    square->set_open_south(true);
-    square->set_open_west(true);
-    return BuildLevelJsonFromView(bootstrap);
-}
-
-std::string ClientApp::BuildLevelJsonFromView(const mud::v1::LocalViewUpdate& view) const
-{
-    std::unordered_map<std::int64_t, const mud::v1::VisibleSquare*> squares_by_coord;
-    squares_by_coord.reserve(static_cast<std::size_t>(view.squares_size()));
-    for (const auto& square : view.squares())
-    {
-        squares_by_coord[CoordKey(square.x(), square.y())] = &square;
-    }
-
-    const auto has_square = [&](int x, int y) -> bool
-    {
-        return squares_by_coord.find(CoordKey(x, y)) != squares_by_coord.end();
-    };
-
-    std::vector<CubeSpec> floor_cubes;
-    std::vector<CubeSpec> wall_cubes;
-    std::vector<CubeSpec> player_cubes;
-    std::vector<CubeSpec> npc_cubes;
-    std::unordered_set<std::int64_t> ground_coords;
-    std::unordered_set<std::int64_t> wall_coords;
-    ground_coords.reserve(static_cast<std::size_t>(view.squares_size()) * 3u);
-    wall_coords.reserve(static_cast<std::size_t>(view.squares_size()) * 2u);
-
-    for (const auto& square : view.squares())
-    {
-        const std::int64_t square_key = CoordKey(square.x(), square.y());
-        ground_coords.insert(square_key);
-
-        if (square.kind() == mud::v1::SQUARE_KIND_WALL)
-        {
-            wall_coords.insert(square_key);
-            continue;
-        }
-
-        if (!square.open_north() && !has_square(square.x(), square.y() - 1))
-        {
-            wall_coords.insert(CoordKey(square.x(), square.y() - 1));
-        }
-        if (!square.open_west() && !has_square(square.x() - 1, square.y()))
-        {
-            wall_coords.insert(CoordKey(square.x() - 1, square.y()));
-        }
-        if (!square.open_south() && !has_square(square.x(), square.y() + 1))
-        {
-            wall_coords.insert(CoordKey(square.x(), square.y() + 1));
-        }
-        if (!square.open_east() && !has_square(square.x() + 1, square.y()))
-        {
-            wall_coords.insert(CoordKey(square.x() + 1, square.y()));
-        }
-    }
-
-    if (ground_coords.empty())
-    {
-        ground_coords.insert(CoordKey(view.center_x(), view.center_y()));
-    }
-    for (const std::int64_t wall_key : wall_coords)
-    {
-        ground_coords.insert(wall_key);
-    }
-
-    int min_square_x = view.center_x();
-    int max_square_x = view.center_x();
-    int min_square_y = view.center_y();
-    int max_square_y = view.center_y();
-    for (const std::int64_t coord_key : ground_coords)
-    {
-        const int x = CoordXFromKey(coord_key);
-        const int y = CoordYFromKey(coord_key);
-        min_square_x = std::min(min_square_x, x);
-        max_square_x = std::max(max_square_x, x);
-        min_square_y = std::min(min_square_y, y);
-        max_square_y = std::max(max_square_y, y);
-    }
-
-    // Keep the local ground watertight even when some interior cells are omitted from
-    // visibility (for example by LOS clipping around corners).
-    for (int y = min_square_y; y <= max_square_y; ++y)
-    {
-        for (int x = min_square_x; x <= max_square_x; ++x)
-        {
-            ground_coords.insert(CoordKey(x, y));
-        }
-    }
-
-    const float base_center_x =
-        (static_cast<float>(min_square_x + max_square_x) * 0.5f) * kCellSize;
-    const float base_center_z =
-        (static_cast<float>(min_square_y + max_square_y) * 0.5f) * kCellSize;
-    const float base_span_x =
-        (static_cast<float>((max_square_x - min_square_x) + 1) + (2.0f * kBaseFloorMarginCells)) *
-        kCellSize;
-    const float base_span_z =
-        (static_cast<float>((max_square_y - min_square_y) + 1) + (2.0f * kBaseFloorMarginCells)) *
-        kCellSize;
-    AddCubeSpec(floor_cubes, base_center_x, kBaseFloorCenterY, base_center_z, base_span_x,
-                kBaseFloorThickness, base_span_z);
-
-    for (const std::int64_t ground_key : ground_coords)
-    {
-        const float x = static_cast<float>(CoordXFromKey(ground_key)) * kCellSize;
-        const float z = static_cast<float>(CoordYFromKey(ground_key)) * kCellSize;
-        AddCubeSpec(floor_cubes, x, kFloorCenterY, z, kFloorTileSize, kFloorThickness,
-                    kFloorTileSize);
-    }
-
-    for (const std::int64_t wall_key : wall_coords)
-    {
-        const float wall_x = static_cast<float>(CoordXFromKey(wall_key)) * kCellSize;
-        const float wall_z = static_cast<float>(CoordYFromKey(wall_key)) * kCellSize;
-        AddCubeSpec(wall_cubes, wall_x, kWallCenterY, wall_z, kWallCubeSize, kWallHeight,
-                    kWallCubeSize);
-    }
-
-    for (const auto& actor : view.actors())
-    {
-        if (actor.kind() == mud::v1::VisibleActor::KIND_SELF)
-        {
-            continue;
-        }
-
-        const float x = static_cast<float>(actor.x()) * kCellSize;
-        const float z = static_cast<float>(actor.y()) * kCellSize;
-        if (actor.kind() == mud::v1::VisibleActor::KIND_NPC)
-        {
-            AddCubeSpec(npc_cubes, x, kGroundY + (kNpcHeight * 0.5f), z, kNpcWidth, kNpcHeight,
-                        kNpcWidth);
-        }
-        else
-        {
-            AddCubeSpec(player_cubes, x, kGroundY + (kPlayerHeight * 0.5f), z, kPlayerWidth,
-                        kPlayerHeight, kPlayerWidth);
-        }
-    }
-
-    const std::filesystem::path model_root = std::filesystem::path("asset") / "model";
-    std::filesystem::create_directories(model_root);
-    WriteRaytraceObj(model_root / "grpcmud_floor.obj", floor_cubes);
-    WriteRaytraceObj(model_root / "grpcmud_wall.obj", wall_cubes);
-    WriteRaytraceObj(model_root / "grpcmud_player.obj", player_cubes);
-    WriteRaytraceObj(model_root / "grpcmud_npc.obj", npc_cubes);
-
-    const std::uint64_t geometry_hash =
-        Fnv1aAppend(
-            Fnv1aAppend(
-                Fnv1aAppend(HashCubeSpecs(floor_cubes), HashCubeSpecs(wall_cubes)),
-                HashCubeSpecs(player_cubes)),
-            HashCubeSpecs(npc_cubes));
-    std::ostringstream geometry_revision;
-    geometry_revision << std::hex << std::setw(16) << std::setfill('0') << geometry_hash;
-    const std::string scene_name = "grpcMUDRaytrace-" + geometry_revision.str();
-
-    const float cam_x = static_cast<float>(view.center_x()) * kCellSize;
-    const float cam_z = static_cast<float>(view.center_y()) * kCellSize;
-    const FacingVec facing = ToFacingVec(view.facing());
-    const float target_x = cam_x + (facing.x * kCameraForwardDistance);
-    const float target_z = cam_z + (facing.z * kCameraForwardDistance);
-
-    std::ostringstream json;
-    json << "{"
-         << "\"name\":\"" << scene_name << "\","
-         << "\"default_texture_name\":\"billboard\","
-         << "\"textures\":[{"
-         << "\"name\":\"billboard\","
-         << "\"size\":{\"x\":-1,\"y\":-1},"
-         << "\"cubemap\":false,"
-         << "\"pixel_element_size\":{\"value\":\"BYTE\"},"
-         << "\"pixel_structure\":{\"value\":\"RGB\"}"
-         << "},{"
-         << "\"name\":\"ground_texture\","
-         << "\"cubemap\":false,"
-         << "\"pixel_element_size\":{\"value\":\"BYTE\"},"
-         << "\"pixel_structure\":{\"value\":\"RGB\"},"
-         << "\"file_name\":\"asset/texture/grpcmud_ground_grass.png\""
-         << "},{"
-         << "\"name\":\"wall_texture\","
-         << "\"cubemap\":false,"
-         << "\"pixel_element_size\":{\"value\":\"BYTE\"},"
-         << "\"pixel_structure\":{\"value\":\"RGB\"},"
-         << "\"file_name\":\"asset/texture/grpcmud_wall_rock.jpg\""
-         << "}],"
-         << "\"programs\":["
-         << "{"
-         << "\"name\":\"RayTraceProgram\","
-         << "\"output_texture_names\":[\"billboard\"],"
-         << "\"input_texture_names\":[\"ground_texture\",\"wall_texture\"],"
-         << "\"input_scene_type\":{\"value\":\"QUAD\"},"
-         << "\"shader_vertex\":\"grpcmud_raytrace.vert\","
-         << "\"shader_fragment\":\"grpcmud_raytrace.frag\","
-         << "\"shader_compute\":\"\""
-         << ",\"bindings\":["
-         << "{\"name\":\"ground_texture\",\"binding\":0,\"binding_type\":\"COMBINED_IMAGE_SAMPLER\",\"stages\":[\"FRAGMENT\"]},"
-         << "{\"name\":\"wall_texture\",\"binding\":1,\"binding_type\":\"COMBINED_IMAGE_SAMPLER\",\"stages\":[\"FRAGMENT\"]},"
-         << "{\"name\":\"FloorTriangles\",\"binding\":2,\"binding_type\":\"STORAGE_BUFFER\",\"stages\":[\"FRAGMENT\"]},"
-         << "{\"name\":\"WallTriangles\",\"binding\":3,\"binding_type\":\"STORAGE_BUFFER\",\"stages\":[\"FRAGMENT\"]},"
-         << "{\"name\":\"PlayerTriangles\",\"binding\":4,\"binding_type\":\"STORAGE_BUFFER\",\"stages\":[\"FRAGMENT\"]},"
-         << "{\"name\":\"NpcTriangles\",\"binding\":5,\"binding_type\":\"STORAGE_BUFFER\",\"stages\":[\"FRAGMENT\"]},"
-         << "{\"name\":\"UniformBlock\",\"binding\":6,\"binding_type\":\"UNIFORM_BUFFER\",\"stages\":[\"FRAGMENT\"]}"
-         << "]"
-         << ",\"uniforms\":["
-         << "{\"name\":\"projection_inv\",\"uniform_enum\":\"PROJECTION_INV_MAT4\"},"
-         << "{\"name\":\"view_inv\",\"uniform_enum\":\"VIEW_INV_MAT4\"},"
-         << "{\"name\":\"camera_position\",\"uniform_enum\":\"CAMERA_POSITION_VEC3\"},"
-         << "{\"name\":\"model_inv\",\"uniform_enum\":\"MODEL_INV_MAT4\"}"
-         << "]"
-         << "},"
-         << "{"
-         << "\"name\":\"RayTracePreprocessProgram\","
-         << "\"input_scene_type\":{\"value\":\"SCENE\"},"
-         << "\"shader_vertex\":\"grpcmud_preprocess.vert\","
-         << "\"shader_fragment\":\"grpcmud_preprocess.frag\","
-         << "\"shader_compute\":\"\""
-         << ",\"uniforms\":["
-         << "{\"name\":\"projection\",\"uniform_enum\":\"PROJECTION_MAT4\"},"
-         << "{\"name\":\"view\",\"uniform_enum\":\"VIEW_MAT4\"},"
-         << "{\"name\":\"model\",\"uniform_enum\":\"MODEL_MAT4\"}"
-         << "]"
-         << "}"
-         << "],"
-         << "\"materials\":["
-         << "{"
-         << "\"name\":\"RayTraceMaterial\","
-         << "\"program_name\":\"RayTraceProgram\","
-         << "\"texture_names\":[\"ground_texture\",\"wall_texture\"],"
-         << "\"inner_names\":[\"ground_texture\",\"wall_texture\"],"
-         << "\"buffer_names\":[\"FloorMesh.0.triangle\",\"WallMesh.0.triangle\",\"PlayerMesh.0.triangle\",\"NpcMesh.0.triangle\"],"
-         << "\"inner_buffer_names\":[\"FloorTriangles\",\"WallTriangles\",\"PlayerTriangles\",\"NpcTriangles\"]"
-         << "},"
-         << "{"
-         << "\"name\":\"RayTracePreprocessMaterial\","
-         << "\"program_name\":\"RayTracePreprocessProgram\","
-         << "\"texture_names\":[],"
-         << "\"inner_names\":[]"
-         << "}"
-         << "],"
-         << "\"scene_tree\":{"
-         << "\"default_root_name\":\"root\","
-         << "\"default_camera_name\":\"camera\","
-         << "\"node_matrices\":[{\"name\":\"root\",\"matrix\":{\"m11\":1,\"m22\":1,\"m33\":1,\"m44\":1}}],"
-         << "\"node_cameras\":[{"
-         << "\"name\":\"camera\","
-         << "\"parent\":\"root\","
-         << "\"position\":{\"x\":" << cam_x << ",\"y\":" << kCameraHeight << ",\"z\":" << cam_z
-         << "},"
-         << "\"target\":{\"x\":" << target_x << ",\"y\":" << kCameraHeight << ",\"z\":" << target_z
-         << "},"
-         << "\"up\":{\"x\":0,\"y\":1,\"z\":0},"
-         << "\"fov_degrees\":68.0,"
-         << "\"aspect_ratio\":1.777777,"
-         << "\"near_clip\":" << kCameraNearClip << ","
-         << "\"far_clip\":200.0"
-         << "}],"
-         << "\"node_static_meshes\":["
-         << "{\"name\":\"RayTracingRendering\",\"parent\":\"root\",\"mesh_enum\":\"QUAD\",\"material_name\":\"RayTraceMaterial\"},"
-         << "{\"name\":\"FloorMesh\",\"parent\":\"root\",\"file_name\":\"grpcmud_floor.obj\",\"material_name\":\"RayTracePreprocessMaterial\",\"render_time_enum\":\"PRE_RENDER_TIME\"},"
-         << "{\"name\":\"WallMesh\",\"parent\":\"root\",\"file_name\":\"grpcmud_wall.obj\",\"material_name\":\"RayTracePreprocessMaterial\",\"render_time_enum\":\"PRE_RENDER_TIME\"},"
-         << "{\"name\":\"PlayerMesh\",\"parent\":\"root\",\"file_name\":\"grpcmud_player.obj\",\"material_name\":\"RayTracePreprocessMaterial\",\"render_time_enum\":\"PRE_RENDER_TIME\"},"
-         << "{\"name\":\"NpcMesh\",\"parent\":\"root\",\"file_name\":\"grpcmud_npc.obj\",\"material_name\":\"RayTracePreprocessMaterial\",\"render_time_enum\":\"PRE_RENDER_TIME\"}"
-         << "],"
-         << "\"node_lights\":[]"
-         << "}"
-         << "}";
-    return json.str();
 }
 
 bool ClientApp::RebuildSceneIfDirty(frame::WindowInterface& window)
@@ -1649,18 +937,17 @@ bool ClientApp::RebuildSceneIfDirty(frame::WindowInterface& window)
     scene_dirty_ = false;
     try
     {
-        const std::string level_json =
-            latest_view_ ? BuildLevelJsonFromView(*latest_view_) : BuildBootstrapLevelJson();
-        if (level_json == last_level_json_)
-        {
-            return true;
-        }
+        const scene::SceneLevelBuildResult level_build =
+            latest_view_ ? scene::BuildLevelProtoFromView(*latest_view_)
+                         : scene::BuildBootstrapLevelProto();
 
         if (window.GetDevice().GetDeviceEnum() == frame::RenderingAPIEnum::VULKAN)
         {
             const auto asset_root = frame::file::FindDirectory("asset");
-            const auto level_data = frame::json::ParseLevelData(window.GetSize(), level_json,
-                                                                asset_root);
+            const auto level_data = frame::json::ParseLevelData(
+                window.GetSize(),
+                level_build.level_proto,
+                asset_root);
             auto* vulkan_device = dynamic_cast<frame::vulkan::Device*>(&window.GetDevice());
             if (!vulkan_device)
             {
@@ -1670,10 +957,9 @@ bool ClientApp::RebuildSceneIfDirty(frame::WindowInterface& window)
         }
         else
         {
-            auto level = frame::json::ParseLevel(window.GetSize(), level_json);
+            auto level = frame::json::ParseLevel(window.GetSize(), level_build.level_proto);
             window.GetDevice().Startup(std::move(level));
         }
-        last_level_json_ = level_json;
     }
     catch (const std::exception& ex)
     {

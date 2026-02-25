@@ -6,6 +6,8 @@ add_executable(
   main.cpp
   ClientApp.cpp
   GrpcSession.cpp
+  SceneLevelBuilder.cpp
+  ViewMath.cpp
 )
 
 target_link_libraries(grpcmud_client PRIVATE grpcmud_proto)

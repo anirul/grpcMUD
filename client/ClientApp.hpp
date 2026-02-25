@@ -28,7 +28,6 @@ public:
 private:
     static std::string Trim(const std::string& text);
     static std::string ToLower(std::string text);
-    static std::string JsonEscape(const std::string& text);
     bool TryConnect();
 
     std::string NextRequestId();
@@ -51,8 +50,6 @@ private:
     bool ConsumeInputFocusRequest();
     void RequestInputFocus();
 
-    std::string BuildBootstrapLevelJson() const;
-    std::string BuildLevelJsonFromView(const mud::v1::LocalViewUpdate& view) const;
     void HandleViewUpdate(const mud::v1::LocalViewUpdate& view);
     void UpdateTickIntervalEstimate(const mud::v1::TickEvent& tick);
     void UpdateCameraAnimation();
@@ -91,7 +88,7 @@ private:
     std::deque<std::string> logs_;
     std::array<char, 512> chat_input_buffer_{};
     std::optional<mud::v1::LocalViewUpdate> latest_view_;
-    std::string last_level_json_;
+    std::optional<std::uint64_t> last_scene_signature_;
     bool camera_pose_initialized_ = false;
     bool camera_animating_ = false;
     float camera_current_x_ = 0.0f;
