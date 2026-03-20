@@ -1,6 +1,7 @@
 #include "WorldState.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -29,6 +30,12 @@ constexpr int kRangedRange = 3;
 constexpr int kMeleeDamage = 2;
 constexpr int kRangedDamage = 1;
 constexpr int kPlayerRespawnDelaySeconds = 10;
+constexpr std::array<const char*, 5> kPreferredSpawnSquares = {
+    "sq-5-9",
+    "sq-4-9",
+    "sq-6-9",
+    "sq-3-9",
+    "sq-7-9"};
 
 FacingDirection RotateLeft(FacingDirection direction)
 {
@@ -181,7 +188,12 @@ WorldState::WorldState(std::string map_db_path)
     RecomputeOpenEdgesFromWalls();
 
     BuildCoordinateIndex();
+    const std::size_t initial_npc_count = npcs_.size();
     SpawnDefaultNpcs();
+    if (npcs_.size() != initial_npc_count)
+    {
+        SaveMapToDisk();
+    }
 }
 
 bool WorldState::SaveMapToDisk() const
@@ -202,7 +214,24 @@ PlayerSnapshot WorldState::AddPlayer(const std::string& requested_name)
     Player player;
     player.id = "player-" + std::to_string(next_player_id_++);
     player.name = requested_name;
-    player.square_id = RandomFreeSquareId();
+    for (const char* preferred_square_id : kPreferredSpawnSquares)
+    {
+        auto square_it = squares_.find(preferred_square_id);
+        if (square_it == squares_.end() || square_it->second.kind == SquareKind::kWall)
+        {
+            continue;
+        }
+        if (IsSquareOccupied(preferred_square_id))
+        {
+            continue;
+        }
+        player.square_id = preferred_square_id;
+        break;
+    }
+    if (player.square_id.empty())
+    {
+        player.square_id = RandomFreeSquareId();
+    }
     if (player.square_id.empty())
     {
         for (const auto& [id, square] : squares_)
@@ -1503,45 +1532,59 @@ void WorldState::BuildCoordinateIndex()
 
 void WorldState::SpawnDefaultNpcs()
 {
-    if (!npcs_.empty())
+    const auto has_npc_named = [&](const std::string& name)
     {
-        return;
-    }
-
-    npcs_.clear();
-
-    const auto add_npc = [&](const std::string& name, int x, int y)
-    {
-        auto key_it = coordinate_index_.find(CoordinateKey(x, y));
-        if (key_it == coordinate_index_.end())
-        {
-            return;
-        }
-
-        const std::string& square_id = key_it->second;
-        auto square_it = squares_.find(square_id);
-        if (square_it == squares_.end() || square_it->second.kind == SquareKind::kWall)
-        {
-            return;
-        }
-        if (IsSquareOccupied(square_id))
-        {
-            return;
-        }
-
-        Npc npc;
-        npc.id = "npc-" + std::to_string(next_npc_id_++);
-        npc.name = name;
-        npc.square_id = square_id;
-        std::uniform_int_distribution<int> facing_dist(0, 3);
-        npc.facing = static_cast<FacingDirection>(facing_dist(rng_));
-        npc.hp = kNpcMaxHp;
-        npcs_[npc.id] = npc;
+        return std::any_of(
+            npcs_.begin(),
+            npcs_.end(),
+            [&](const auto& entry)
+            {
+                return entry.second.name == name;
+            });
     };
 
-    add_npc("wolf scout", map_width_ - 2, map_height_ - 2);
-    add_npc("bandit archer", map_width_ - 2, 1);
-    add_npc("rust sentinel", map_width_ / 2, map_height_ / 2);
+    const auto add_npc = [&](const std::string& name,
+                             std::initializer_list<std::pair<int, int>> preferred_positions)
+    {
+        if (has_npc_named(name))
+        {
+            return;
+        }
+
+        for (const auto& [x, y] : preferred_positions)
+        {
+            auto key_it = coordinate_index_.find(CoordinateKey(x, y));
+            if (key_it == coordinate_index_.end())
+            {
+                continue;
+            }
+
+            const std::string& square_id = key_it->second;
+            auto square_it = squares_.find(square_id);
+            if (square_it == squares_.end() || square_it->second.kind == SquareKind::kWall)
+            {
+                continue;
+            }
+            if (IsSquareOccupied(square_id))
+            {
+                continue;
+            }
+
+            Npc npc;
+            npc.id = "npc-" + std::to_string(next_npc_id_++);
+            npc.name = name;
+            npc.square_id = square_id;
+            std::uniform_int_distribution<int> facing_dist(0, 3);
+            npc.facing = static_cast<FacingDirection>(facing_dist(rng_));
+            npc.hp = kNpcMaxHp;
+            npcs_[npc.id] = npc;
+            return;
+        }
+    };
+
+    add_npc("wolf scout", {{4, 8}, {3, 8}, {4, 7}, {3, 9}});
+    add_npc("bandit archer", {{6, 8}, {7, 8}, {6, 7}, {7, 9}});
+    add_npc("rust sentinel", {{5, 5}, {4, 6}, {6, 6}});
 }
 
 bool WorldState::IsSquareOpen(const Square& square, FacingDirection direction) const
@@ -1863,7 +1906,25 @@ int WorldState::RespawnSecondsRemaining(const Player& player) const
 
 void WorldState::RespawnPlayer(Player& player)
 {
-    std::string respawn_square_id = RandomFreeSquareId();
+    std::string respawn_square_id;
+    for (const char* preferred_square_id : kPreferredSpawnSquares)
+    {
+        auto square_it = squares_.find(preferred_square_id);
+        if (square_it == squares_.end() || square_it->second.kind == SquareKind::kWall)
+        {
+            continue;
+        }
+        if (IsSquareOccupied(preferred_square_id, player.id))
+        {
+            continue;
+        }
+        respawn_square_id = preferred_square_id;
+        break;
+    }
+    if (respawn_square_id.empty())
+    {
+        respawn_square_id = RandomFreeSquareId();
+    }
     if (respawn_square_id.empty())
     {
         if (!player.square_id.empty())
