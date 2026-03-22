@@ -41,9 +41,6 @@ constexpr float kNpcHeight = 1.55f;
 constexpr float kNpcWidth = 0.65f;
 constexpr std::uint64_t kFnvOffset = 1469598103934665603ull;
 constexpr std::uint64_t kFnvPrime = 1099511628211ull;
-constexpr char kSkyboxPath[] = "asset/cubemap/hamarikyu.hdr";
-constexpr char kSkyboxEnvPath[] = "asset/cubemap/hamarikyu_env.hdr";
-
 struct CubeSpec
 {
     float tx = 0.0f;
@@ -948,6 +945,54 @@ frame::proto::Texture MakeSolidTexture(
     return texture;
 }
 
+frame::proto::Texture MakeSolidCubemapTexture(
+    const std::string& name,
+    const std::array<float, 4>& color,
+    frame::proto::PixelElementSize::Enum element_size)
+{
+    frame::proto::Texture texture;
+    texture.set_name(name);
+    texture.set_cubemap(true);
+    texture.mutable_size()->set_x(1);
+    texture.mutable_size()->set_y(1);
+    texture.mutable_pixel_structure()->set_value(frame::proto::PixelStructure::RGB_ALPHA);
+    texture.mutable_pixel_element_size()->set_value(element_size);
+
+    if (element_size == frame::proto::PixelElementSize::FLOAT)
+    {
+        std::array<float, 24> pixels = {};
+        for (int face = 0; face < 6; ++face)
+        {
+            std::copy(
+                color.begin(),
+                color.end(),
+                pixels.begin() + static_cast<std::ptrdiff_t>(face * 4));
+        }
+        texture.set_pixels(
+            reinterpret_cast<const char*>(pixels.data()),
+            static_cast<int>(pixels.size() * sizeof(float)));
+        return texture;
+    }
+
+    const std::array<std::uint8_t, 4> texel = {
+        static_cast<std::uint8_t>(std::clamp(color[0], 0.0f, 1.0f) * 255.0f),
+        static_cast<std::uint8_t>(std::clamp(color[1], 0.0f, 1.0f) * 255.0f),
+        static_cast<std::uint8_t>(std::clamp(color[2], 0.0f, 1.0f) * 255.0f),
+        static_cast<std::uint8_t>(std::clamp(color[3], 0.0f, 1.0f) * 255.0f)};
+    std::array<std::uint8_t, 24> pixels = {};
+    for (int face = 0; face < 6; ++face)
+    {
+        std::copy(
+            texel.begin(),
+            texel.end(),
+            pixels.begin() + static_cast<std::ptrdiff_t>(face * 4));
+    }
+    texture.set_pixels(
+        reinterpret_cast<const char*>(pixels.data()),
+        static_cast<int>(pixels.size()));
+    return texture;
+}
+
 void AddDefaultRaytraceTextures(frame::proto::Level* level_proto)
 {
     const auto add_byte_texture =
@@ -1122,29 +1167,17 @@ frame::proto::SceneTree MakeSceneTree(const mud::v1::LocalViewUpdate& view)
         "grpcmud_npc.gltf",
         frame::proto::NodeMesh::PRE_RENDER_TIME);
 
-    auto* sun = scene_tree.add_node_lights();
-    sun->set_name("sun");
-    sun->set_parent("root");
-    sun->set_light_type(frame::proto::NodeLight::DIRECTIONAL_LIGHT);
-    sun->set_shadow_type(frame::proto::NodeLight::HARD_SHADOW);
-    sun->mutable_direction()->set_x(0.42f);
-    sun->mutable_direction()->set_y(-1.00f);
-    sun->mutable_direction()->set_z(0.28f);
-    sun->mutable_color()->set_x(1.00f);
-    sun->mutable_color()->set_y(0.95f);
-    sun->mutable_color()->set_z(0.90f);
-
     auto* torch = scene_tree.add_node_lights();
     torch->set_name("torch");
     torch->set_parent("root");
     torch->set_light_type(frame::proto::NodeLight::POINT_LIGHT);
     torch->set_shadow_type(frame::proto::NodeLight::NO_SHADOW);
-    torch->mutable_position()->set_x(cam_x);
-    torch->mutable_position()->set_y(kCameraHeight + 0.25f);
-    torch->mutable_position()->set_z(cam_z);
-    torch->mutable_color()->set_x(1.00f);
-    torch->mutable_color()->set_y(0.72f);
-    torch->mutable_color()->set_z(0.46f);
+    torch->mutable_position()->set_x(cam_x + (facing.x * 0.30f));
+    torch->mutable_position()->set_y(kCameraHeight - 0.18f);
+    torch->mutable_position()->set_z(cam_z + (facing.z * 0.30f));
+    torch->mutable_color()->set_x(4.80f);
+    torch->mutable_color()->set_y(3.40f);
+    torch->mutable_color()->set_z(2.00f);
 
     return scene_tree;
 }
@@ -1272,9 +1305,15 @@ SceneLevelBuildResult BuildLevelProtoFromView(const mud::v1::LocalViewUpdate& vi
     result.level_proto.set_default_texture_name("albedo");
     *result.level_proto.add_textures() = MakeRenderTexture("albedo");
     *result.level_proto.add_textures() =
-        MakeEnvironmentTexture("skybox", kSkyboxPath);
+        MakeSolidCubemapTexture(
+            "skybox",
+            {0.0f, 0.0f, 0.0f, 1.0f},
+            frame::proto::PixelElementSize::BYTE);
     *result.level_proto.add_textures() =
-        MakeEnvironmentTexture("skybox_env", kSkyboxEnvPath);
+        MakeSolidCubemapTexture(
+            "skybox_env",
+            {0.0f, 0.0f, 0.0f, 1.0f},
+            frame::proto::PixelElementSize::BYTE);
     AddDefaultRaytraceTextures(&result.level_proto);
     *result.level_proto.mutable_scene_tree() = MakeSceneTree(view);
     return result;
