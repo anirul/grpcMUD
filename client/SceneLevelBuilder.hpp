@@ -12,6 +12,8 @@ inline constexpr float kCellSize = 2.0f;
 inline constexpr float kCameraHeight = 0.92f;
 inline constexpr float kCameraForwardDistance = 2.0f;
 inline constexpr float kCameraNearClip = 0.12f;
+inline constexpr float kTorchForwardOffset = 0.30f;
+inline constexpr float kTorchHeightOffset = -0.18f;
 
 struct SceneLevelBuildResult
 {

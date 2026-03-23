@@ -1172,9 +1172,9 @@ frame::proto::SceneTree MakeSceneTree(const mud::v1::LocalViewUpdate& view)
     torch->set_parent("root");
     torch->set_light_type(frame::proto::NodeLight::POINT_LIGHT);
     torch->set_shadow_type(frame::proto::NodeLight::NO_SHADOW);
-    torch->mutable_position()->set_x(cam_x + (facing.x * 0.30f));
-    torch->mutable_position()->set_y(kCameraHeight - 0.18f);
-    torch->mutable_position()->set_z(cam_z + (facing.z * 0.30f));
+    torch->mutable_position()->set_x(cam_x + (facing.x * kTorchForwardOffset));
+    torch->mutable_position()->set_y(kCameraHeight + kTorchHeightOffset);
+    torch->mutable_position()->set_z(cam_z + (facing.z * kTorchForwardOffset));
     torch->mutable_color()->set_x(4.80f);
     torch->mutable_color()->set_y(3.40f);
     torch->mutable_color()->set_z(2.00f);

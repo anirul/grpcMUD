@@ -55,6 +55,7 @@ private:
     void UpdateCameraAnimation();
     void StartPredictedStepAnimation(mud::v1::StepKind kind);
     void ApplyCameraPose(frame::WindowInterface& window);
+    void ApplyTorchPose(frame::WindowInterface& window);
     bool RebuildSceneIfDirty(frame::WindowInterface& window);
     bool RenderFrame(frame::WindowInterface& window);
     bool DrawHud();
