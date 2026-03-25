@@ -8,6 +8,12 @@
 namespace grpcmud::client::scene
 {
 
+enum class SceneRenderBackend
+{
+    OpenGL,
+    Vulkan,
+};
+
 inline constexpr float kCellSize = 2.0f;
 inline constexpr float kCameraHeight = 0.92f;
 inline constexpr float kCameraForwardDistance = 2.0f;
@@ -22,7 +28,9 @@ struct SceneLevelBuildResult
 };
 
 std::uint64_t ComputeRelativeSceneSignature(const mud::v1::LocalViewUpdate& view);
-SceneLevelBuildResult BuildBootstrapLevelProto();
-SceneLevelBuildResult BuildLevelProtoFromView(const mud::v1::LocalViewUpdate& view);
+SceneLevelBuildResult BuildBootstrapLevelProto(SceneRenderBackend backend);
+SceneLevelBuildResult BuildLevelProtoFromView(
+    const mud::v1::LocalViewUpdate& view,
+    SceneRenderBackend backend);
 
 } // namespace grpcmud::client::scene

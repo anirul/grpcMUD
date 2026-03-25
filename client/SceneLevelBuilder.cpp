@@ -948,7 +948,8 @@ frame::proto::Texture MakeSolidTexture(
 frame::proto::Texture MakeSolidCubemapTexture(
     const std::string& name,
     const std::array<float, 4>& color,
-    frame::proto::PixelElementSize::Enum element_size)
+    frame::proto::PixelElementSize::Enum element_size,
+    SceneRenderBackend backend)
 {
     frame::proto::Texture texture;
     texture.set_name(name);
@@ -957,6 +958,14 @@ frame::proto::Texture MakeSolidCubemapTexture(
     texture.mutable_size()->set_y(1);
     texture.mutable_pixel_structure()->set_value(frame::proto::PixelStructure::RGB_ALPHA);
     texture.mutable_pixel_element_size()->set_value(element_size);
+
+    if (backend == SceneRenderBackend::OpenGL)
+    {
+        // The OpenGL cubemap loader does not accept inline proto pixel blobs yet.
+        // An empty file-name cubemap still produces a valid 1x1 black placeholder.
+        texture.set_file_name("");
+        return texture;
+    }
 
     if (element_size == frame::proto::PixelElementSize::FLOAT)
     {
@@ -1290,7 +1299,9 @@ std::uint64_t ComputeRelativeSceneSignature(const mud::v1::LocalViewUpdate& view
     return hash;
 }
 
-SceneLevelBuildResult BuildLevelProtoFromView(const mud::v1::LocalViewUpdate& view)
+SceneLevelBuildResult BuildLevelProtoFromView(
+    const mud::v1::LocalViewUpdate& view,
+    SceneRenderBackend backend)
 {
     const GeometryData geometry = BuildGeometry(view);
     WriteGeometryGltfs(geometry);
@@ -1308,18 +1319,20 @@ SceneLevelBuildResult BuildLevelProtoFromView(const mud::v1::LocalViewUpdate& vi
         MakeSolidCubemapTexture(
             "skybox",
             {0.0f, 0.0f, 0.0f, 1.0f},
-            frame::proto::PixelElementSize::BYTE);
+            frame::proto::PixelElementSize::BYTE,
+            backend);
     *result.level_proto.add_textures() =
         MakeSolidCubemapTexture(
             "skybox_env",
             {0.0f, 0.0f, 0.0f, 1.0f},
-            frame::proto::PixelElementSize::BYTE);
+            frame::proto::PixelElementSize::BYTE,
+            backend);
     AddDefaultRaytraceTextures(&result.level_proto);
     *result.level_proto.mutable_scene_tree() = MakeSceneTree(view);
     return result;
 }
 
-SceneLevelBuildResult BuildBootstrapLevelProto()
+SceneLevelBuildResult BuildBootstrapLevelProto(SceneRenderBackend backend)
 {
     mud::v1::LocalViewUpdate bootstrap;
     bootstrap.set_center_x(0);
@@ -1334,7 +1347,7 @@ SceneLevelBuildResult BuildBootstrapLevelProto()
     square->set_open_east(true);
     square->set_open_south(true);
     square->set_open_west(true);
-    return BuildLevelProtoFromView(bootstrap);
+    return BuildLevelProtoFromView(bootstrap, backend);
 }
 
 } // namespace grpcmud::client::scene

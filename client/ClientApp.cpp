@@ -38,7 +38,7 @@
 ABSL_FLAG(std::string, server_address, "localhost:50051", "gRPC server address.");
 ABSL_FLAG(std::string, player_name, "",
           "Player name to join as. If empty, the client prompts interactively.");
-ABSL_FLAG(std::string, render_api, "opengl",
+ABSL_FLAG(std::string, render_api, "vulkan",
           "Rendering backend for the client (opengl|vulkan).");
 
 namespace grpcmud::client
@@ -83,14 +83,14 @@ int ClientApp::Run(int argc, char** argv)
     }
 
     const std::string requested_backend = ToLower(Trim(absl::GetFlag(FLAGS_render_api)));
-    frame::RenderingAPIEnum rendering_api = frame::RenderingAPIEnum::OPENGL;
-    if (requested_backend.empty() || requested_backend == "opengl")
-    {
-        rendering_api = frame::RenderingAPIEnum::OPENGL;
-    }
-    else if (requested_backend == "vulkan")
+    frame::RenderingAPIEnum rendering_api = frame::RenderingAPIEnum::VULKAN;
+    if (requested_backend.empty() || requested_backend == "vulkan")
     {
         rendering_api = frame::RenderingAPIEnum::VULKAN;
+    }
+    else if (requested_backend == "opengl")
+    {
+        rendering_api = frame::RenderingAPIEnum::OPENGL;
     }
     else
     {
@@ -967,9 +967,13 @@ bool ClientApp::RebuildSceneIfDirty(frame::WindowInterface& window)
     scene_dirty_ = false;
     try
     {
+        const scene::SceneRenderBackend scene_backend =
+            window.GetDevice().GetDeviceEnum() == frame::RenderingAPIEnum::VULKAN
+                ? scene::SceneRenderBackend::Vulkan
+                : scene::SceneRenderBackend::OpenGL;
         const scene::SceneLevelBuildResult level_build =
-            latest_view_ ? scene::BuildLevelProtoFromView(*latest_view_)
-                         : scene::BuildBootstrapLevelProto();
+            latest_view_ ? scene::BuildLevelProtoFromView(*latest_view_, scene_backend)
+                         : scene::BuildBootstrapLevelProto(scene_backend);
 
         if (window.GetDevice().GetDeviceEnum() == frame::RenderingAPIEnum::VULKAN)
         {
