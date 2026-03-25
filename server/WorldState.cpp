@@ -21,8 +21,8 @@ namespace grpcmud::server
 {
 namespace
 {
-constexpr int kDefaultMapWidth = 11;
-constexpr int kDefaultMapHeight = 11;
+constexpr int kDefaultMapWidth = 20;
+constexpr int kDefaultMapHeight = 20;
 constexpr int kPlayerMaxHp = 5;
 constexpr int kNpcMaxHp = 4;
 constexpr int kMeleeRange = 1;
@@ -30,12 +30,15 @@ constexpr int kRangedRange = 3;
 constexpr int kMeleeDamage = 2;
 constexpr int kRangedDamage = 1;
 constexpr int kPlayerRespawnDelaySeconds = 10;
-constexpr std::array<const char*, 5> kPreferredSpawnSquares = {
-    "sq-5-9",
-    "sq-4-9",
-    "sq-6-9",
-    "sq-3-9",
-    "sq-7-9"};
+constexpr std::array<const char*, 8> kPreferredSpawnSquares = {
+    "sq-9-17",
+    "sq-10-17",
+    "sq-8-17",
+    "sq-11-17",
+    "sq-9-18",
+    "sq-10-18",
+    "sq-8-18",
+    "sq-11-18"};
 
 FacingDirection RotateLeft(FacingDirection direction)
 {
@@ -1430,6 +1433,121 @@ void WorldState::CreateDefaultMapData()
     map_width_ = kDefaultMapWidth;
     map_height_ = kDefaultMapHeight;
 
+    const auto coord_key = [](int x, int y) -> std::int64_t
+    {
+        return (static_cast<std::int64_t>(x) << 32) ^ static_cast<std::uint32_t>(y);
+    };
+
+    std::unordered_set<std::int64_t> wall_coords;
+    wall_coords.reserve(static_cast<std::size_t>(map_width_ * map_height_));
+
+    const auto add_wall = [&](int x, int y)
+    {
+        wall_coords.insert(coord_key(x, y));
+    };
+
+    const auto add_vertical_wall = [&](int x, int min_y, int max_y,
+                                       std::initializer_list<int> gaps = {})
+    {
+        for (int y = min_y; y <= max_y; ++y)
+        {
+            if (std::find(gaps.begin(), gaps.end(), y) != gaps.end())
+            {
+                continue;
+            }
+            add_wall(x, y);
+        }
+    };
+
+    const auto add_horizontal_wall = [&](int y, int min_x, int max_x,
+                                         std::initializer_list<int> gaps = {})
+    {
+        for (int x = min_x; x <= max_x; ++x)
+        {
+            if (std::find(gaps.begin(), gaps.end(), x) != gaps.end())
+            {
+                continue;
+            }
+            add_wall(x, y);
+        }
+    };
+
+    const auto add_wall_block = [&](int min_x, int max_x, int min_y, int max_y)
+    {
+        for (int y = min_y; y <= max_y; ++y)
+        {
+            for (int x = min_x; x <= max_x; ++x)
+            {
+                add_wall(x, y);
+            }
+        }
+    };
+
+    for (int x = 0; x < map_width_; ++x)
+    {
+        add_wall(x, 0);
+        add_wall(x, map_height_ - 1);
+    }
+    for (int y = 0; y < map_height_; ++y)
+    {
+        add_wall(0, y);
+        add_wall(map_width_ - 1, y);
+    }
+
+    // South breach line and north ruins create several lanes instead of one flat room.
+    add_horizontal_wall(15, 3, 16, {5, 9, 10, 14});
+    add_horizontal_wall(4, 3, 16, {5, 9, 10, 14});
+
+    // Midfield spines split the arena into flank routes and a contested center.
+    add_vertical_wall(6, 6, 13, {8, 11});
+    add_vertical_wall(13, 6, 13, {8, 11});
+
+    // Side pockets give melee players cover while keeping them connected to the outer lanes.
+    add_wall_block(4, 5, 7, 8);
+    add_wall_block(14, 15, 7, 8);
+    add_wall_block(4, 5, 11, 12);
+    add_wall_block(14, 15, 11, 12);
+
+    // A dense center core creates crossfire, short peeks, and circular flanks around it.
+    add_wall(8, 8);
+    add_wall(11, 8);
+    add_wall(8, 11);
+    add_wall(11, 11);
+    add_wall_block(9, 10, 9, 10);
+
+    // Light cover in the north overlook prevents it from becoming a pure firing gallery.
+    add_wall(7, 2);
+    add_wall(12, 2);
+
+    const auto floor_description = [](int x, int y) -> std::string
+    {
+        if (y >= 16)
+        {
+            return "The south mustering yard gives new arrivals a breath before the charge.";
+        }
+        if (y == 15 || y == 4)
+        {
+            return "A shattered breach funnels movement into a handful of dangerous lanes.";
+        }
+        if (y <= 3)
+        {
+            return "The north overlook is littered with broken arrows and spent bolts.";
+        }
+        if (x <= 2 || x >= 17)
+        {
+            return "A narrow outer lane hugs the arena wall and rewards patient flanks.";
+        }
+        if (x >= 7 && x <= 12 && y >= 7 && y <= 12)
+        {
+            return "The broken center ring is all hard angles, cover, and crossfire.";
+        }
+        if (((x >= 4 && x <= 5) || (x >= 14 && x <= 15)) && y >= 7 && y <= 12)
+        {
+            return "Stone cover in the side pocket makes every ambush feel close.";
+        }
+        return "A scarred lane between barricades keeps every step exposed.";
+    };
+
     for (int y = 0; y < map_height_; ++y)
     {
         for (int x = 0; x < map_width_; ++x)
@@ -1439,24 +1557,14 @@ void WorldState::CreateDefaultMapData()
             square.x = x;
             square.y = y;
             square.kind = SquareKind::kFloor;
-
-            if (x == 0 || y == 0 || x == (map_width_ - 1) || y == (map_height_ - 1))
-            {
-                square.kind = SquareKind::kWall;
-            }
-
-            // Thick maze walls inside the arena.
-            if ((x == 5 && y >= 2 && y <= 8 && y != 5) ||
-                (y == 5 && x >= 2 && x <= 8 && x != 5) ||
-                (x == 3 && y == 3) || (x == 7 && y == 7) || (x == 3 && y == 7) ||
-                (x == 7 && y == 3))
+            if (wall_coords.find(coord_key(x, y)) != wall_coords.end())
             {
                 square.kind = SquareKind::kWall;
             }
 
             square.description = (square.kind == SquareKind::kWall)
                                      ? "A rough stone wall blocks the way."
-                                     : "A battle square on the quest board.";
+                                     : floor_description(x, y);
             squares_[square.id] = square;
         }
     }
@@ -1582,9 +1690,12 @@ void WorldState::SpawnDefaultNpcs()
         }
     };
 
-    add_npc("wolf scout", {{4, 8}, {3, 8}, {4, 7}, {3, 9}});
-    add_npc("bandit archer", {{6, 8}, {7, 8}, {6, 7}, {7, 9}});
-    add_npc("rust sentinel", {{5, 5}, {4, 6}, {6, 6}});
+    add_npc("wolf scout", {{4, 13}, {3, 13}, {5, 13}, {4, 14}});
+    add_npc("bandit archer", {{15, 13}, {16, 13}, {14, 13}, {15, 14}});
+    add_npc("rust sentinel", {{9, 8}, {10, 8}, {9, 7}, {10, 7}});
+    add_npc("tunnel lurker", {{3, 6}, {4, 6}, {2, 6}, {3, 5}});
+    add_npc("spire hunter", {{16, 6}, {15, 6}, {17, 6}, {16, 5}});
+    add_npc("overlook brute", {{9, 2}, {10, 2}, {9, 3}, {10, 3}});
 }
 
 bool WorldState::IsSquareOpen(const Square& square, FacingDirection direction) const
