@@ -29,6 +29,7 @@
 #include "frame/gui/gui_window_interface.h"
 #include "frame/json/parse_level.h"
 #include "frame/logger.h"
+#include "frame/node_light.h"
 #include "frame/vulkan/device.h"
 #include "frame/vulkan/window_factory.h"
 #include "frame/window_factory.h"
@@ -927,6 +928,35 @@ void ClientApp::ApplyCameraPose(frame::WindowInterface& window)
     camera.SetFront(glm::vec3(facing_x, 0.0f, facing_z));
 }
 
+void ClientApp::ApplyTorchPose(frame::WindowInterface& window)
+{
+    if (!camera_pose_initialized_)
+    {
+        return;
+    }
+
+    auto& level = window.GetDevice().GetLevel();
+    const frame::EntityId torch_node_id = level.GetIdFromName("torch");
+    if (torch_node_id == frame::NullId)
+    {
+        return;
+    }
+
+    auto* torch_node =
+        dynamic_cast<frame::NodeLight*>(&level.GetSceneNodeFromId(torch_node_id));
+    if (!torch_node)
+    {
+        return;
+    }
+
+    const float facing_x = std::cos(camera_current_yaw_);
+    const float facing_z = std::sin(camera_current_yaw_);
+    auto* position = torch_node->GetData().mutable_position();
+    position->set_x(camera_current_x_ + (facing_x * scene::kTorchForwardOffset));
+    position->set_y(scene::kCameraHeight + scene::kTorchHeightOffset);
+    position->set_z(camera_current_z_ + (facing_z * scene::kTorchForwardOffset));
+}
+
 bool ClientApp::RebuildSceneIfDirty(frame::WindowInterface& window)
 {
     if (!scene_dirty_)
@@ -979,6 +1009,7 @@ bool ClientApp::RenderFrame(frame::WindowInterface& window)
         return running_.load(std::memory_order_relaxed);
     }
     ApplyCameraPose(window);
+    ApplyTorchPose(window);
     return running_.load(std::memory_order_relaxed);
 }
 
