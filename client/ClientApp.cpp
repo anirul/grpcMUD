@@ -1,6 +1,8 @@
 
 #include "ClientApp.hpp"
 
+#include "AssetPaths.hpp"
+#include <SDL3/SDL_keyboard.h>
 #include <SDL3/SDL_keycode.h>
 #include <imgui.h>
 
@@ -24,7 +26,6 @@
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
 #include "frame/api.h"
-#include "frame/file/file_system.h"
 #include "frame/gui/draw_gui_factory.h"
 #include "frame/gui/gui_window_interface.h"
 #include "frame/json/parse_level.h"
@@ -49,16 +50,25 @@ constexpr std::size_t kMaxLogLines = 128;
 constexpr glm::uvec2 kDefaultWindowSize{1280u, 720u};
 constexpr std::uint64_t kMinTickIntervalEstimateMs = 100;
 constexpr std::uint64_t kMaxTickIntervalEstimateMs = 1500;
+constexpr std::size_t kHeldStepBindingCount = 4;
 
-std::filesystem::path ResolveProjectAssetRoot()
+struct HeldStepBinding
 {
-    static const std::filesystem::path asset_root = [] {
-        const auto frame_asset_root = frame::file::FindDirectory(
-            std::filesystem::path("external") / "frame" / "asset");
-        return (frame_asset_root.parent_path().parent_path().parent_path() / "asset")
-            .lexically_normal();
-    }();
-    return asset_root;
+    mud::v1::StepKind kind = mud::v1::STEP_KIND_UNSPECIFIED;
+    std::array<SDL_Scancode, 2> scancodes{
+        SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN};
+};
+
+constexpr std::array<HeldStepBinding, kHeldStepBindingCount> kHeldStepBindings{{
+    {mud::v1::STEP_KIND_MOVE_FORWARD, {SDL_SCANCODE_W, SDL_SCANCODE_UNKNOWN}},
+    {mud::v1::STEP_KIND_TURN_LEFT, {SDL_SCANCODE_A, SDL_SCANCODE_UNKNOWN}},
+    {mud::v1::STEP_KIND_MOVE_BACKWARD, {SDL_SCANCODE_S, SDL_SCANCODE_UNKNOWN}},
+    {mud::v1::STEP_KIND_TURN_RIGHT, {SDL_SCANCODE_D, SDL_SCANCODE_UNKNOWN}},
+}};
+
+void LogAssetMessage(const std::string& message)
+{
+    frame::Logger::GetInstance()->warn("[asset] {}", message);
 }
 
 using namespace grpcmud::client::viewmath;
@@ -141,17 +151,23 @@ int ClientApp::Run(int argc, char** argv)
     AddLog("Enter server + player name in HUD and press Connect.");
     AddLog(std::string("Renderer: ") +
            (rendering_api == frame::RenderingAPIEnum::VULKAN ? "vulkan" : "opengl"));
+    LogAssetMessage("cwd: " + std::filesystem::current_path().string());
+    LogAssetMessage("project root: " + assetpaths::ResolveProjectRoot().string());
+    LogAssetMessage(
+        "project asset root: " + assetpaths::ResolveProjectAssetRoot().string());
+    LogAssetMessage("frame asset root: " + assetpaths::ResolveFrameAssetRoot().string());
 
     RegisterKeyBindings(*window);
 
     std::filesystem::path font_path;
-    try
+    const auto font_resolution = assetpaths::ResolveAsset(
+        std::filesystem::path("font") / "poppins" / "Poppins-Regular.ttf");
+    LogAssetMessage(
+        "font/poppins/Poppins-Regular.ttf -> " + font_resolution.path.string() + " (" +
+        std::string(assetpaths::AssetSourceLabel(font_resolution.source)) + ")");
+    if (font_resolution.exists)
     {
-        font_path = frame::file::FindFile("external/frame/asset/font/poppins/Poppins-Regular.ttf");
-    }
-    catch (const std::exception&)
-    {
-        font_path.clear();
+        font_path = font_resolution.path;
     }
 
     auto gui = frame::gui::CreateDrawGui(*window, font_path, 18.0f);
@@ -490,6 +506,7 @@ void ClientApp::HandleServerMessageOnMainThread(const mud::v1::ServerMessage& me
 void ClientApp::HandleServerClosed()
 {
     server_closed_.store(true, std::memory_order_relaxed);
+    ClearHeldStepInput();
 }
 
 void ClientApp::HandleActionKey(char key)
@@ -546,26 +563,87 @@ void ClientApp::HandleActionKey(char key)
         RequestInputFocus();
         return;
     }
-    if (key == 'w' || key == 'k')
+}
+
+void ClientApp::ClearHeldStepInput()
+{
+    held_step_down_.fill(false);
+    held_step_press_order_.fill(0);
+    active_held_step_kind_.reset();
+    last_held_step_attempt_tick_id_ = std::numeric_limits<std::uint64_t>::max();
+}
+
+void ClientApp::UpdateHeldStepInput()
+{
+    int numkeys = 0;
+    const bool* keyboard_state = SDL_GetKeyboardState(&numkeys);
+    if (!keyboard_state || SDL_GetKeyboardFocus() == nullptr || IsInputFocused() ||
+        !connected_ || server_closed_.load(std::memory_order_relaxed) ||
+        death_screen_active_)
     {
-        SendStepRequest(mud::v1::STEP_KIND_MOVE_FORWARD);
+        ClearHeldStepInput();
         return;
     }
-    if (key == 'a' || key == 'h')
+
+    for (std::size_t i = 0; i < kHeldStepBindings.size(); ++i)
     {
-        SendStepRequest(mud::v1::STEP_KIND_TURN_LEFT);
+        bool is_down = false;
+        for (const SDL_Scancode scancode : kHeldStepBindings[i].scancodes)
+        {
+            if (scancode == SDL_SCANCODE_UNKNOWN)
+            {
+                continue;
+            }
+            const auto index = static_cast<int>(scancode);
+            if (index >= 0 && index < numkeys && keyboard_state[index])
+            {
+                is_down = true;
+                break;
+            }
+        }
+
+        if (is_down && !held_step_down_[i])
+        {
+            held_step_press_order_[i] = next_held_step_press_order_++;
+        }
+        held_step_down_[i] = is_down;
+        if (!is_down)
+        {
+            held_step_press_order_[i] = 0;
+        }
+    }
+
+    std::optional<mud::v1::StepKind> desired_step_kind;
+    std::uint64_t desired_press_order = 0;
+    for (std::size_t i = 0; i < kHeldStepBindings.size(); ++i)
+    {
+        if (!held_step_down_[i])
+        {
+            continue;
+        }
+        if (!desired_step_kind.has_value() ||
+            held_step_press_order_[i] > desired_press_order)
+        {
+            desired_step_kind = kHeldStepBindings[i].kind;
+            desired_press_order = held_step_press_order_[i];
+        }
+    }
+
+    active_held_step_kind_ = desired_step_kind;
+    if (!active_held_step_kind_.has_value())
+    {
+        last_held_step_attempt_tick_id_ = std::numeric_limits<std::uint64_t>::max();
         return;
     }
-    if (key == 's' || key == 'j')
+
+    const std::uint64_t current_tick = latest_tick_id_.load(std::memory_order_relaxed);
+    if (current_tick == last_held_step_attempt_tick_id_)
     {
-        SendStepRequest(mud::v1::STEP_KIND_MOVE_BACKWARD);
         return;
     }
-    if (key == 'd' || key == 'l')
-    {
-        SendStepRequest(mud::v1::STEP_KIND_TURN_RIGHT);
-        return;
-    }
+
+    last_held_step_attempt_tick_id_ = current_tick;
+    SendStepRequest(*active_held_step_kind_);
 }
 
 void ClientApp::HandleSubmittedText(const std::string& text)
@@ -989,7 +1067,8 @@ bool ClientApp::RebuildSceneIfDirty(frame::WindowInterface& window)
 
         if (window.GetDevice().GetDeviceEnum() == frame::RenderingAPIEnum::VULKAN)
         {
-            const auto asset_root = ResolveProjectAssetRoot();
+            const auto asset_root = assetpaths::ResolveProjectAssetRoot();
+            LogAssetMessage("Vulkan level asset root: " + asset_root.string());
             const auto level_data = frame::json::ParseLevelData(
                 window.GetSize(),
                 level_build.level_proto,
@@ -1003,6 +1082,9 @@ bool ClientApp::RebuildSceneIfDirty(frame::WindowInterface& window)
         }
         else
         {
+            LogAssetMessage(
+                "OpenGL shared asset root: " +
+                assetpaths::ResolveProjectAssetRoot().string());
             auto level = frame::json::ParseLevel(window.GetSize(), level_build.level_proto);
             window.GetDevice().Startup(std::move(level));
         }
@@ -1019,6 +1101,7 @@ bool ClientApp::RebuildSceneIfDirty(frame::WindowInterface& window)
 bool ClientApp::RenderFrame(frame::WindowInterface& window)
 {
     ProcessQueuedServerMessages();
+    UpdateHeldStepInput();
     UpdateCameraAnimation();
     if (!RebuildSceneIfDirty(window))
     {
@@ -1151,14 +1234,6 @@ void ClientApp::RegisterKeyBindings(frame::WindowInterface& window)
     };
 
     bind(SDLK_Q, 'q');
-    bind(SDLK_W, 'w');
-    bind(SDLK_A, 'a');
-    bind(SDLK_S, 's');
-    bind(SDLK_D, 'd');
-    bind(SDLK_H, 'h');
-    bind(SDLK_J, 'j');
-    bind(SDLK_K, 'k');
-    bind(SDLK_L, 'l');
     bind(SDLK_1, '1');
     bind(SDLK_2, '2');
     bind(SDLK_3, '3');
