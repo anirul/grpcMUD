@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="35" failures="2" disabled="0" errors="0" time="414.498" timestamp="2026-03-22T20:05:32.379" name="AllTests">
+  <testsuite name="VulkanCommandQueueTest" tests="2" failures="0" disabled="0" skipped="0" errors="0" time="0.277" timestamp="2026-03-22T20:05:32.379">
+    <testcase name="CopiesBufferContents" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\command_queue_test.cpp" line="104" status="run" result="completed" time="0.203" timestamp="2026-03-22T20:05:32.379" classname="VulkanCommandQueueTest" />
+    <testcase name="TransitionsAndCopiesToImage" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\command_queue_test.cpp" line="141" status="run" result="completed" time="0.073" timestamp="2026-03-22T20:05:32.583" classname="VulkanCommandQueueTest" />
+  </testsuite>
+  <testsuite name="VulkanRayTracingDualParseTest" tests="8" failures="1" disabled="0" skipped="0" errors="0" time="1.603" timestamp="2026-03-22T20:05:32.657">
+    <testcase name="BuildsTriangleBuffersFromScene" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="314" status="run" result="completed" time="0.29" timestamp="2026-03-22T20:05:32.657" classname="VulkanRayTracingDualParseTest" />
+    <testcase name="UsesHardwareRaytracingStageFiles" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="340" status="run" result="completed" time="0.006" timestamp="2026-03-22T20:05:32.947" classname="VulkanRayTracingDualParseTest" />
+    <testcase name="SceneMaterialCarriesAllSharedBindings" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="350" status="run" result="completed" time="0.227" timestamp="2026-03-22T20:05:32.954" classname="VulkanRayTracingDualParseTest" />
+    <testcase name="StaticRaytraceSceneStateUsesMeshHolderTransform" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="406" status="run" result="completed" time="0.224" timestamp="2026-03-22T20:05:33.181" classname="VulkanRayTracingDualParseTest" />
+    <testcase name="HardwarePreferredBuildSkipsCpuBvhData" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="428" status="run" result="completed" time="0.216" timestamp="2026-03-22T20:05:33.406" classname="VulkanRayTracingDualParseTest" />
+    <testcase name="TriangleDataLooksValid" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="473" status="run" result="completed" time="0.203" timestamp="2026-03-22T20:05:33.623" classname="VulkanRayTracingDualParseTest" />
+    <testcase name="ImportsGltfGlassMaterialFromIco" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="495" status="run" result="completed" time="0.218" timestamp="2026-03-22T20:05:33.826" classname="VulkanRayTracingDualParseTest" />
+    <testcase name="ImportsGltfOpaqueSpecularFromPlate" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="568" status="run" result="completed" time="0.215" timestamp="2026-03-22T20:05:34.044" classname="VulkanRayTracingDualParseTest">
+      <failure message="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp:614&#x0A;Expected equality of these values:&#x0A;  plate_albedo_id&#x0A;    Which is: 67&#x0A;  level.GetIdFromName(&quot;albedo_texture&quot;)&#x0A;    Which is: 14&#x0A;" type=""><![CDATA[C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp:614
+Expected equality of these values:
+  plate_albedo_id
+    Which is: 67
+  level.GetIdFromName("albedo_texture")
+    Which is: 14
+]]></failure>
+    </testcase>
+  </testsuite>
+  <testsuite name="VulkanSkinnedRayTracingParseTest" tests="5" failures="0" disabled="0" skipped="0" errors="0" time="1.349" timestamp="2026-03-22T20:05:34.260">
+    <testcase name="HardwarePreferredBuildSkipsCpuBvhForAnimatedScene" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="632" status="run" result="completed" time="0.267" timestamp="2026-03-22T20:05:34.260" classname="VulkanSkinnedRayTracingParseTest" />
+    <testcase name="FoxAnimationChangesRaytraceTriangles" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="674" status="run" result="completed" time="0.251" timestamp="2026-03-22T20:05:34.527" classname="VulkanSkinnedRayTracingParseTest" />
+    <testcase name="SceneMaterialUsesImportedFoxTextures" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="711" status="run" result="completed" time="0.283" timestamp="2026-03-22T20:05:34.779" classname="VulkanSkinnedRayTracingParseTest" />
+    <testcase name="QuaternionNodesStillRotate" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="749" status="run" result="completed" time="0.267" timestamp="2026-03-22T20:05:35.063" classname="VulkanSkinnedRayTracingParseTest" />
+    <testcase name="WorldSpaceRaytraceSceneStateUsesIdentityModelForSkinnedScene" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="770" status="run" result="completed" time="0.278" timestamp="2026-03-22T20:05:35.331" classname="VulkanSkinnedRayTracingParseTest" />
+  </testsuite>
+  <testsuite name="VulkanRayTracingParseTest" tests="9" failures="1" disabled="0" skipped="0" errors="0" time="322.866" timestamp="2026-03-22T20:05:35.610">
+    <testcase name="BuildsTriangleAndBvhBuffersFromScene" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="800" status="run" result="completed" time="44.864" timestamp="2026-03-22T20:05:35.610" classname="VulkanRayTracingParseTest" />
+    <testcase name="UsesHardwareRaytracingStageFiles" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="829" status="run" result="completed" time="0.006" timestamp="2026-03-22T20:06:20.474" classname="VulkanRayTracingParseTest" />
+    <testcase name="DragonSceneUsesSceneFallbackPbrTextures" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="839" status="run" result="completed" time="44.786" timestamp="2026-03-22T20:06:20.481" classname="VulkanRayTracingParseTest">
+      <failure message="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp:866&#x0A;Expected equality of these values:&#x0A;  albedo_id&#x0A;    Which is: 46&#x0A;  level.GetIdFromName(&quot;albedo_texture&quot;)&#x0A;    Which is: 14&#x0A;" type=""><![CDATA[C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp:866
+Expected equality of these values:
+  albedo_id
+    Which is: 46
+  level.GetIdFromName("albedo_texture")
+    Which is: 14
+]]></failure>
+    </testcase>
+    <testcase name="HardwarePreferredBuildSkipsCpuBvhData" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="873" status="run" result="completed" time="9.205" timestamp="2026-03-22T20:07:05.267" classname="VulkanRayTracingParseTest" />
+    <testcase name="TriangleAndBvhDataLooksValid" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="904" status="run" result="completed" time="44.35" timestamp="2026-03-22T20:07:14.472" classname="VulkanRayTracingParseTest" />
+    <testcase name="DragonTriangleUvsVaryWhenMeshHasNoTexcoords" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="955" status="run" result="completed" time="44.78" timestamp="2026-03-22T20:07:58.823" classname="VulkanRayTracingParseTest" />
+    <testcase name="CpuTraversesBvhFromCameraCenterRay" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="1103" status="run" result="completed" time="44.986" timestamp="2026-03-22T20:08:43.603" classname="VulkanRayTracingParseTest" />
+    <testcase name="ShaderLikeRayFromCenterHitsGeometry" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="1151" status="run" result="completed" time="45.326" timestamp="2026-03-22T20:09:28.590" classname="VulkanRayTracingParseTest" />
+    <testcase name="BuildsSceneStateWithoutExplicitModelNodeBinding" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\raytracing_test.cpp" line="1220" status="run" result="completed" time="44.559" timestamp="2026-03-22T20:10:13.916" classname="VulkanRayTracingParseTest" />
+  </testsuite>
+  <testsuite name="VulkanSceneStateTest" tests="2" failures="0" disabled="0" skipped="0" errors="0" time="87.908" timestamp="2026-03-22T20:10:58.476">
+    <testcase name="BuildsProjectionViewAndModelMatrices" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\scene_state_test.cpp" line="33" status="run" result="completed" time="43.915" timestamp="2026-03-22T20:10:58.476" classname="VulkanSceneStateTest" />
+    <testcase name="CarriesLightInformation" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\scene_state_test.cpp" line="53" status="run" result="completed" time="43.992" timestamp="2026-03-22T20:11:42.392" classname="VulkanSceneStateTest" />
+  </testsuite>
+  <testsuite name="VulkanResourceFixture" tests="5" failures="0" disabled="0" skipped="0" errors="0" time="0.411" timestamp="2026-03-22T20:12:26.384">
+    <testcase name="MeshResourcesBuildFallbackQuad" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\resource_manager_test.cpp" line="120" status="run" result="completed" time="0.092" timestamp="2026-03-22T20:12:26.384" classname="VulkanResourceFixture" />
+    <testcase name="MeshResourcesUploadCustomMesh" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\resource_manager_test.cpp" line="138" status="run" result="completed" time="0.079" timestamp="2026-03-22T20:12:26.477" classname="VulkanResourceFixture" />
+    <testcase name="BufferResourcesMirrorCpuBuffer" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\resource_manager_test.cpp" line="162" status="run" result="completed" time="0.082" timestamp="2026-03-22T20:12:26.556" classname="VulkanResourceFixture" />
+    <testcase name="BufferResourcesUploadDataVisible" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\resource_manager_test.cpp" line="186" status="run" result="completed" time="0.078" timestamp="2026-03-22T20:12:26.639" classname="VulkanResourceFixture" />
+    <testcase name="BufferResourcesUpdateUniformData" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\resource_manager_test.cpp" line="235" status="run" result="completed" time="0.078" timestamp="2026-03-22T20:12:26.717" classname="VulkanResourceFixture" />
+  </testsuite>
+  <testsuite name="VulkanBuildLevelTest" tests="3" failures="0" disabled="0" skipped="0" errors="0" time="0.081" timestamp="2026-03-22T20:12:26.796">
+    <testcase name="BuildLevelPopulatesDefaultScene" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\window_test.cpp" line="29" status="run" result="completed" time="0.032" timestamp="2026-03-22T20:12:26.796" classname="VulkanBuildLevelTest" />
+    <testcase name="BuildLevelRegistersProgramsMaterialsAndTextures" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\window_test.cpp" line="51" status="run" result="completed" time="0.041" timestamp="2026-03-22T20:12:26.828" classname="VulkanBuildLevelTest" />
+    <testcase name="BuildMeshVerticesFromStaticMeshInfo" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\window_test.cpp" line="76" status="run" result="completed" time="0.007" timestamp="2026-03-22T20:12:26.870" classname="VulkanBuildLevelTest" />
+  </testsuite>
+  <testsuite name="VulkanWindowInputTest" tests="1" failures="0" disabled="0" skipped="0" errors="0" time="0." timestamp="2026-03-22T20:12:26.877">
+    <testcase name="GuiToggleKeyMatchesOpenGLBehavior" file="C:\Users\frede\github\grpcMUD\external\frame\tests\frame\vulkan\window_input_test.cpp" line="10" status="run" result="completed" time="0." timestamp="2026-03-22T20:12:26.877" classname="VulkanWindowInputTest" />
+  </testsuite>
+</testsuites>

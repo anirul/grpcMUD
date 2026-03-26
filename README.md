@@ -78,14 +78,14 @@ Example:
 ### Start client
 
 ```powershell
-.\build\windows\client\Debug\grpcmud_client.exe --server_address=localhost:50051 --player_name=alice --render_api=opengl
+.\build\windows\client\Debug\grpcmud_client.exe --server_address=localhost:50051 --player_name=alice --render_api=vulkan
 ```
 
 Client flags:
 
 - `--server_address=<host:port>` default `localhost:50051`
 - `--player_name=<name>` default empty (enter in HUD)
-- `--render_api=<opengl|vulkan>` default `opengl`
+- `--render_api=<opengl|vulkan>` default `vulkan`
 
 The client also accepts positional args:
 

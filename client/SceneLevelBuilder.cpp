@@ -20,6 +20,7 @@
 #include <glm/glm.hpp>
 
 #include "ViewMath.hpp"
+#include "frame/file/file_system.h"
 
 namespace grpcmud::client::scene
 {
@@ -105,6 +106,30 @@ struct BufferViewInfo
     std::size_t length = 0;
     int target = 0;
 };
+
+std::filesystem::path ResolveProjectRoot()
+{
+    static const std::filesystem::path root = [] {
+        const auto frame_asset_root = frame::file::FindDirectory(
+            std::filesystem::path("external") / "frame" / "asset");
+        return frame_asset_root.parent_path().parent_path().parent_path();
+    }();
+    return root;
+}
+
+std::filesystem::path ResolveProjectAssetRoot()
+{
+    static const std::filesystem::path asset_root =
+        (ResolveProjectRoot() / "asset").lexically_normal();
+    return asset_root;
+}
+
+std::filesystem::path ResolveFrameAssetRoot()
+{
+    static const std::filesystem::path frame_asset_root =
+        (ResolveProjectRoot() / "external" / "frame" / "asset").lexically_normal();
+    return frame_asset_root;
+}
 
 std::int64_t CoordKey(int x, int y)
 {
@@ -632,9 +657,8 @@ void EnsureFrameAssetsAvailable()
         return;
     }
 
-    const std::filesystem::path frame_asset_root =
-        std::filesystem::path("external") / "frame" / "asset";
-    const std::filesystem::path asset_root = "asset";
+    const std::filesystem::path frame_asset_root = ResolveFrameAssetRoot();
+    const std::filesystem::path asset_root = ResolveProjectAssetRoot();
 
     std::filesystem::create_directories(asset_root);
     CopyDirectoryContents(frame_asset_root / "shader", asset_root / "shader");
@@ -847,11 +871,11 @@ void WriteGltfMesh(
     WriteTextFileIfChanged(gltf_path, json.str());
 }
 
-void WriteGeometryGltfs(const GeometryData& geometry)
+std::filesystem::path WriteGeometryGltfs(const GeometryData& geometry)
 {
     EnsureFrameAssetsAvailable();
 
-    const std::filesystem::path model_root = std::filesystem::path("asset") / "model";
+    const std::filesystem::path model_root = ResolveProjectAssetRoot() / "model";
     std::filesystem::create_directories(model_root);
 
     WriteGltfMesh(
@@ -886,6 +910,7 @@ void WriteGeometryGltfs(const GeometryData& geometry)
             .base_color = glm::vec4(0.92f, 0.12f, 0.10f, 1.0f),
             .roughness = 0.58f,
             .metallic = 0.03f});
+    return model_root;
 }
 
 frame::proto::Texture MakeRenderTexture(const std::string& name)
@@ -948,7 +973,8 @@ frame::proto::Texture MakeSolidTexture(
 frame::proto::Texture MakeSolidCubemapTexture(
     const std::string& name,
     const std::array<float, 4>& color,
-    frame::proto::PixelElementSize::Enum element_size)
+    frame::proto::PixelElementSize::Enum element_size,
+    SceneRenderBackend backend)
 {
     frame::proto::Texture texture;
     texture.set_name(name);
@@ -957,6 +983,14 @@ frame::proto::Texture MakeSolidCubemapTexture(
     texture.mutable_size()->set_y(1);
     texture.mutable_pixel_structure()->set_value(frame::proto::PixelStructure::RGB_ALPHA);
     texture.mutable_pixel_element_size()->set_value(element_size);
+
+    if (backend == SceneRenderBackend::OpenGL)
+    {
+        // The OpenGL cubemap loader does not accept inline proto pixel blobs yet.
+        // An empty file-name cubemap still allocates a valid placeholder texture.
+        texture.set_file_name("");
+        return texture;
+    }
 
     if (element_size == frame::proto::PixelElementSize::FLOAT)
     {
@@ -1097,7 +1131,9 @@ void AddIdentityMatrixNode(
     matrix->set_m44(1.0f);
 }
 
-frame::proto::SceneTree MakeSceneTree(const mud::v1::LocalViewUpdate& view)
+frame::proto::SceneTree MakeSceneTree(
+    const mud::v1::LocalViewUpdate& view,
+    const std::filesystem::path& model_root)
 {
     const float cam_x = static_cast<float>(view.center_x()) * kCellSize;
     const float cam_z = static_cast<float>(view.center_y()) * kCellSize;
@@ -1146,25 +1182,25 @@ frame::proto::SceneTree MakeSceneTree(const mud::v1::LocalViewUpdate& view)
         &scene_tree,
         "FloorMesh",
         "mesh_holder",
-        "grpcmud_floor.gltf",
+        (model_root / "grpcmud_floor.gltf").generic_string(),
         frame::proto::NodeMesh::PRE_RENDER_TIME);
     AddSceneFileMeshNode(
         &scene_tree,
         "WallMesh",
         "mesh_holder",
-        "grpcmud_wall.gltf",
+        (model_root / "grpcmud_wall.gltf").generic_string(),
         frame::proto::NodeMesh::PRE_RENDER_TIME);
     AddSceneFileMeshNode(
         &scene_tree,
         "PlayerMesh",
         "mesh_holder",
-        "grpcmud_player.gltf",
+        (model_root / "grpcmud_player.gltf").generic_string(),
         frame::proto::NodeMesh::PRE_RENDER_TIME);
     AddSceneFileMeshNode(
         &scene_tree,
         "NpcMesh",
         "mesh_holder",
-        "grpcmud_npc.gltf",
+        (model_root / "grpcmud_npc.gltf").generic_string(),
         frame::proto::NodeMesh::PRE_RENDER_TIME);
 
     auto* torch = scene_tree.add_node_lights();
@@ -1290,10 +1326,12 @@ std::uint64_t ComputeRelativeSceneSignature(const mud::v1::LocalViewUpdate& view
     return hash;
 }
 
-SceneLevelBuildResult BuildLevelProtoFromView(const mud::v1::LocalViewUpdate& view)
+SceneLevelBuildResult BuildLevelProtoFromView(
+    const mud::v1::LocalViewUpdate& view,
+    SceneRenderBackend backend)
 {
     const GeometryData geometry = BuildGeometry(view);
-    WriteGeometryGltfs(geometry);
+    const std::filesystem::path model_root = WriteGeometryGltfs(geometry);
 
     const std::uint64_t geometry_hash = HashGeometry(geometry);
     std::ostringstream revision;
@@ -1308,18 +1346,20 @@ SceneLevelBuildResult BuildLevelProtoFromView(const mud::v1::LocalViewUpdate& vi
         MakeSolidCubemapTexture(
             "skybox",
             {0.0f, 0.0f, 0.0f, 1.0f},
-            frame::proto::PixelElementSize::BYTE);
+            frame::proto::PixelElementSize::BYTE,
+            backend);
     *result.level_proto.add_textures() =
         MakeSolidCubemapTexture(
             "skybox_env",
             {0.0f, 0.0f, 0.0f, 1.0f},
-            frame::proto::PixelElementSize::BYTE);
+            frame::proto::PixelElementSize::BYTE,
+            backend);
     AddDefaultRaytraceTextures(&result.level_proto);
-    *result.level_proto.mutable_scene_tree() = MakeSceneTree(view);
+    *result.level_proto.mutable_scene_tree() = MakeSceneTree(view, model_root);
     return result;
 }
 
-SceneLevelBuildResult BuildBootstrapLevelProto()
+SceneLevelBuildResult BuildBootstrapLevelProto(SceneRenderBackend backend)
 {
     mud::v1::LocalViewUpdate bootstrap;
     bootstrap.set_center_x(0);
@@ -1334,7 +1374,7 @@ SceneLevelBuildResult BuildBootstrapLevelProto()
     square->set_open_east(true);
     square->set_open_south(true);
     square->set_open_west(true);
-    return BuildLevelProtoFromView(bootstrap);
+    return BuildLevelProtoFromView(bootstrap, backend);
 }
 
 } // namespace grpcmud::client::scene
