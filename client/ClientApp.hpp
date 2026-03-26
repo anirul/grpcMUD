@@ -5,6 +5,7 @@
 #include <chrono>
 #include <deque>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -42,6 +43,8 @@ private:
     void HandleServerMessageOnMainThread(const mud::v1::ServerMessage& message);
     void HandleServerClosed();
     void HandleActionKey(char key);
+    void UpdateHeldStepInput();
+    void ClearHeldStepInput();
     void HandleSubmittedText(const std::string& text);
     void AddLog(std::string line);
     void TickDeathScreen();
@@ -103,6 +106,12 @@ private:
     float camera_target_yaw_ = 0.0f;
     std::chrono::steady_clock::time_point camera_animation_started_at_{};
     std::chrono::milliseconds camera_animation_duration_{500};
+    std::array<bool, 4> held_step_down_{};
+    std::array<std::uint64_t, 4> held_step_press_order_{};
+    std::optional<mud::v1::StepKind> active_held_step_kind_;
+    std::uint64_t next_held_step_press_order_ = 1;
+    std::uint64_t last_held_step_attempt_tick_id_ =
+        std::numeric_limits<std::uint64_t>::max();
 
     std::mutex pending_messages_mutex_;
     std::deque<mud::v1::ServerMessage> pending_messages_;

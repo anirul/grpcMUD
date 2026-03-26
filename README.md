@@ -102,7 +102,6 @@ Example:
 
 - `W` / `S` move forward/backward
 - `A` / `D` turn left/right
-- `H` `J` `K` `L` vim-style aliases (`K` forward, `J` backward)
 - `1` melee attack
 - `2` ranged attack
 - `3` guard

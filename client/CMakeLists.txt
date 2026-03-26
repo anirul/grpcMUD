@@ -3,6 +3,7 @@ find_package(imgui CONFIG REQUIRED)
 
 add_executable(
   grpcmud_client
+  WIN32
   main.cpp
   ClientApp.cpp
   GrpcSession.cpp

@@ -1,5 +1,6 @@
 #include "SceneLevelBuilder.hpp"
 
+#include "AssetPaths.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -20,7 +21,7 @@
 #include <glm/glm.hpp>
 
 #include "ViewMath.hpp"
-#include "frame/file/file_system.h"
+#include "frame/logger.h"
 
 namespace grpcmud::client::scene
 {
@@ -42,6 +43,12 @@ constexpr float kNpcHeight = 1.55f;
 constexpr float kNpcWidth = 0.65f;
 constexpr std::uint64_t kFnvOffset = 1469598103934665603ull;
 constexpr std::uint64_t kFnvPrime = 1099511628211ull;
+
+void LogAssetMessage(const std::string& message)
+{
+    frame::Logger::GetInstance()->warn("[asset] {}", message);
+}
+
 struct CubeSpec
 {
     float tx = 0.0f;
@@ -106,30 +113,6 @@ struct BufferViewInfo
     std::size_t length = 0;
     int target = 0;
 };
-
-std::filesystem::path ResolveProjectRoot()
-{
-    static const std::filesystem::path root = [] {
-        const auto frame_asset_root = frame::file::FindDirectory(
-            std::filesystem::path("external") / "frame" / "asset");
-        return frame_asset_root.parent_path().parent_path().parent_path();
-    }();
-    return root;
-}
-
-std::filesystem::path ResolveProjectAssetRoot()
-{
-    static const std::filesystem::path asset_root =
-        (ResolveProjectRoot() / "asset").lexically_normal();
-    return asset_root;
-}
-
-std::filesystem::path ResolveFrameAssetRoot()
-{
-    static const std::filesystem::path frame_asset_root =
-        (ResolveProjectRoot() / "external" / "frame" / "asset").lexically_normal();
-    return frame_asset_root;
-}
 
 std::int64_t CoordKey(int x, int y)
 {
@@ -657,15 +640,35 @@ void EnsureFrameAssetsAvailable()
         return;
     }
 
-    const std::filesystem::path frame_asset_root = ResolveFrameAssetRoot();
-    const std::filesystem::path asset_root = ResolveProjectAssetRoot();
+    const std::filesystem::path frame_asset_root = assetpaths::ResolveFrameAssetRoot();
+    const std::filesystem::path asset_root = assetpaths::ResolveProjectAssetRoot();
 
     std::filesystem::create_directories(asset_root);
-    CopyDirectoryContents(frame_asset_root / "shader", asset_root / "shader");
-    CopyDirectoryContents(frame_asset_root / "cubemap", asset_root / "cubemap");
-    CopyDirectoryContents(
-        frame_asset_root / "material" / "plastic",
-        asset_root / "material" / "plastic");
+    if (std::filesystem::exists(frame_asset_root) &&
+        std::filesystem::is_directory(frame_asset_root))
+    {
+        LogAssetMessage(
+            "syncing shared assets from " + frame_asset_root.string() + " to " +
+            asset_root.string());
+        CopyDirectoryContents(frame_asset_root / "shader", asset_root / "shader");
+        CopyDirectoryContents(frame_asset_root / "cubemap", asset_root / "cubemap");
+        CopyDirectoryContents(
+            frame_asset_root / "material" / "plastic",
+            asset_root / "material" / "plastic");
+    }
+    else if (std::filesystem::is_directory(asset_root / "shader") &&
+             std::filesystem::is_directory(asset_root / "cubemap") &&
+             std::filesystem::is_directory(asset_root / "material" / "plastic"))
+    {
+        LogAssetMessage("using shared assets directly from " + asset_root.string());
+    }
+    else if (!std::filesystem::is_directory(asset_root / "shader") ||
+             !std::filesystem::is_directory(asset_root / "cubemap") ||
+             !std::filesystem::is_directory(asset_root / "material" / "plastic"))
+    {
+        throw std::runtime_error(
+            "Missing shared assets in both asset/ and external/frame/asset.");
+    }
 
     synced = true;
 }
@@ -740,6 +743,7 @@ void WriteGltfMesh(
     const std::vector<CubeSpec>& cubes,
     const MaterialSpec& material)
 {
+    LogAssetMessage("generating mesh " + gltf_path.string());
     const MeshBuffers mesh = BuildMeshBuffers(cubes);
     const std::uint32_t vertex_count =
         static_cast<std::uint32_t>(mesh.positions.size() / 3u);
@@ -875,8 +879,10 @@ std::filesystem::path WriteGeometryGltfs(const GeometryData& geometry)
 {
     EnsureFrameAssetsAvailable();
 
-    const std::filesystem::path model_root = ResolveProjectAssetRoot() / "model";
+    const std::filesystem::path model_root =
+        assetpaths::ResolveProjectAssetRoot() / "model";
     std::filesystem::create_directories(model_root);
+    LogAssetMessage("generated model root: " + model_root.string());
 
     WriteGltfMesh(
         model_root / "grpcmud_floor.gltf",
