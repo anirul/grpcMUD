@@ -109,7 +109,10 @@ private:
     std::array<bool, 4> held_step_down_{};
     std::array<std::uint64_t, 4> held_step_press_order_{};
     std::optional<mud::v1::StepKind> active_held_step_kind_;
+    std::uint64_t active_held_step_press_order_ = 0;
     std::uint64_t next_held_step_press_order_ = 1;
+    bool pending_initial_held_step_send_ = false;
+    std::chrono::steady_clock::time_point active_held_step_started_at_{};
     std::uint64_t last_held_step_attempt_tick_id_ =
         std::numeric_limits<std::uint64_t>::max();
 

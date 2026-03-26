@@ -50,6 +50,7 @@ constexpr std::size_t kMaxLogLines = 128;
 constexpr glm::uvec2 kDefaultWindowSize{1280u, 720u};
 constexpr std::uint64_t kMinTickIntervalEstimateMs = 100;
 constexpr std::uint64_t kMaxTickIntervalEstimateMs = 1500;
+constexpr std::uint64_t kHeldStepRepeatDelayFloorMs = 350;
 constexpr std::size_t kHeldStepBindingCount = 4;
 
 struct HeldStepBinding
@@ -418,15 +419,6 @@ void ClientApp::HandleServerMessageOnMainThread(const mud::v1::ServerMessage& me
         return found_digit ? value : -1;
     };
 
-    const std::uint64_t message_tick_id = message.tick_id();
-    std::uint64_t observed_tick = latest_tick_id_.load(std::memory_order_relaxed);
-    while (message_tick_id > observed_tick &&
-           !latest_tick_id_.compare_exchange_weak(observed_tick, message_tick_id,
-                                                  std::memory_order_relaxed,
-                                                  std::memory_order_relaxed))
-    {
-    }
-
     switch (message.payload_case())
     {
     case mud::v1::ServerMessage::kJoinAck:
@@ -490,9 +482,19 @@ void ClientApp::HandleServerMessageOnMainThread(const mud::v1::ServerMessage& me
         AddLog("[pong]");
         break;
     case mud::v1::ServerMessage::kTick:
+    {
+        const std::uint64_t tick_id = message.tick().tick_id();
+        std::uint64_t observed_tick = latest_tick_id_.load(std::memory_order_relaxed);
+        while (tick_id > observed_tick &&
+               !latest_tick_id_.compare_exchange_weak(observed_tick, tick_id,
+                                                      std::memory_order_relaxed,
+                                                      std::memory_order_relaxed))
+        {
+        }
         UpdateTickIntervalEstimate(message.tick());
         TickDeathScreen();
         break;
+    }
     case mud::v1::ServerMessage::kView:
         HandleViewUpdate(message.view());
         break;
@@ -570,6 +572,9 @@ void ClientApp::ClearHeldStepInput()
     held_step_down_.fill(false);
     held_step_press_order_.fill(0);
     active_held_step_kind_.reset();
+    active_held_step_press_order_ = 0;
+    pending_initial_held_step_send_ = false;
+    active_held_step_started_at_ = {};
     last_held_step_attempt_tick_id_ = std::numeric_limits<std::uint64_t>::max();
 }
 
@@ -629,11 +634,25 @@ void ClientApp::UpdateHeldStepInput()
         }
     }
 
-    active_held_step_kind_ = desired_step_kind;
-    if (!active_held_step_kind_.has_value())
+    if (!desired_step_kind.has_value())
     {
+        active_held_step_kind_.reset();
+        active_held_step_press_order_ = 0;
+        pending_initial_held_step_send_ = false;
         last_held_step_attempt_tick_id_ = std::numeric_limits<std::uint64_t>::max();
         return;
+    }
+
+    const bool active_step_changed =
+        !active_held_step_kind_.has_value() || active_held_step_kind_ != desired_step_kind ||
+        active_held_step_press_order_ != desired_press_order;
+    if (active_step_changed)
+    {
+        active_held_step_kind_ = desired_step_kind;
+        active_held_step_press_order_ = desired_press_order;
+        pending_initial_held_step_send_ = true;
+        active_held_step_started_at_ = std::chrono::steady_clock::now();
+        last_held_step_attempt_tick_id_ = std::numeric_limits<std::uint64_t>::max();
     }
 
     const std::uint64_t current_tick = latest_tick_id_.load(std::memory_order_relaxed);
@@ -642,8 +661,24 @@ void ClientApp::UpdateHeldStepInput()
         return;
     }
 
+    bool should_attempt_send = pending_initial_held_step_send_;
+    if (!should_attempt_send)
+    {
+        const auto held_duration = std::chrono::steady_clock::now() - active_held_step_started_at_;
+        const auto repeat_delay = std::chrono::milliseconds(
+            std::max<std::uint64_t>(kHeldStepRepeatDelayFloorMs, tick_interval_estimate_ms_));
+        should_attempt_send = held_duration >= repeat_delay;
+    }
+    if (!should_attempt_send)
+    {
+        return;
+    }
+
     last_held_step_attempt_tick_id_ = current_tick;
-    SendStepRequest(*active_held_step_kind_);
+    if (SendStepRequest(*active_held_step_kind_))
+    {
+        pending_initial_held_step_send_ = false;
+    }
 }
 
 void ClientApp::HandleSubmittedText(const std::string& text)
