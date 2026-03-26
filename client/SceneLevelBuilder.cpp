@@ -987,7 +987,7 @@ frame::proto::Texture MakeSolidCubemapTexture(
     if (backend == SceneRenderBackend::OpenGL)
     {
         // The OpenGL cubemap loader does not accept inline proto pixel blobs yet.
-        // An empty file-name cubemap still allocates a valid placeholder texture.
+        // An empty file-name cubemap still produces a valid 1x1 black placeholder.
         texture.set_file_name("");
         return texture;
     }
